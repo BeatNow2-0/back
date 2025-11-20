@@ -1,4 +1,5 @@
 from datetime import timedelta
+import asyncio
 import os
 from typing import Annotated, List
 import shutil
@@ -40,39 +41,63 @@ async def register(user: NewUser):
     result = await users_collection.insert_one(user_dict)
     ssh = None
     try:
-        # Inicializar SSH con timeout
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        # timeout en connect para no bloquear indefinidamente
-        ssh.connect(hostname=SSH_HOST_RES, username=SSH_USERNAME_RES,
-                    password=SSH_PASSWORD_RES, timeout=10, banner_timeout=10, auth_timeout=10)
+        ssh.connect(hostname=SSH_HOST_RES,
+                    username=SSH_USERNAME_RES,
+                    password=SSH_PASSWORD_RES,
+                    timeout=15, banner_timeout=15, auth_timeout=15)
 
         user_id = await get_user_id(user_dict['username'])
         remote_base = f"/var/www/html/beatnow/{user_id}"
         mkdir_cmd = f"sudo -n mkdir -p {remote_base}/photo_profile {remote_base}/posts"
-        copy_default_cmd = f"sudo -n cp /var/www/html/res/photo-profile.jpg {remote_base}/photo_profile/photo_profile.png"
+        copy_remote_default = f"sudo -n cp /var/www/html/res/photo-profile.jpg {remote_base}/photo_profile/photo_profile.png"
 
-        # Ejecutar comando de creación de directorios con timeout y leer salida
+        # Ejecuta mkdir y verifica
         stdin, stdout, stderr = ssh.exec_command(mkdir_cmd, timeout=20)
-        exit_status = stdout.channel.recv_exit_status()
-        stdout_text = stdout.read().decode(errors="ignore").strip()
-        stderr_text = stderr.read().decode(errors="ignore").strip()
-        if exit_status != 0:
-            # cleanup DB y error claro
+        rc = stdout.channel.recv_exit_status()
+        out = stdout.read().decode(errors="ignore").strip()
+        err = stderr.read().decode(errors="ignore").strip()
+        if rc != 0:
             await users_collection.delete_one({"_id": ObjectId(result.inserted_id)})
-            raise HTTPException(status_code=500, detail=f"Remote mkdir failed: exit={exit_status} stdout='{stdout_text}' stderr='{stderr_text}'")
+            raise HTTPException(status_code=500, detail=f"Remote mkdir failed: rc={rc} out='{out}' err='{err}'")
 
-        # Ejecutar copia del fichero por sudo -n
-        stdin, stdout, stderr = ssh.exec_command(copy_default_cmd, timeout=20)
-        exit_status = stdout.channel.recv_exit_status()
-        stdout_text = stdout.read().decode(errors="ignore").strip()
-        stderr_text = stderr.read().decode(errors="ignore").strip()
-        if exit_status != 0:
-            await users_collection.delete_one({"_id": ObjectId(result.inserted_id)})
-            raise HTTPException(status_code=500, detail=f"Remote copy failed: exit={exit_status} stdout='{stdout_text}' stderr='{stderr_text}'")
+        # Intenta copiar el default remoto; si falla por falta de fichero, sube localmente por SFTP
+        stdin, stdout, stderr = ssh.exec_command(copy_remote_default, timeout=15)
+        rc = stdout.channel.recv_exit_status()
+        out = stdout.read().decode(errors="ignore").strip()
+        err = stderr.read().decode(errors="ignore").strip()
 
-        # Enviar confirmación (si esto puede bloquear, considera hacerlo en background)
-        await send_confirmation(await get_user(await get_username(result.inserted_id)))
+        if rc != 0:
+            # si no existe /var/www/html/res/photo-profile.jpg en remoto, hacemos SFTP upload
+            # Comprueba el tipo de error: si stderr contiene 'No such file' entonces subimos
+            if "No such file" in err or "cannot stat" in err:
+                sftp = ssh.open_sftp()
+                try:
+                    # ruta local del fichero por defecto en tu proyecto (crea este fichero si no existe)
+                    local_default = "/opt/beatnow-back/static/photo-profile.jpg"
+                    if not os.path.exists(local_default):
+                        # si no existe local, no bloqueamos: limpiamos y fallamos con detalle
+                        await users_collection.delete_one({"_id": ObjectId(result.inserted_id)})
+                        raise HTTPException(status_code=500, detail="Local default profile image missing for upload")
+                    remote_target = f"{remote_base}/photo_profile/photo_profile.png"
+                    sftp.put(local_default, remote_target)
+                finally:
+                    try:
+                        sftp.close()
+                    except:
+                        pass
+            else:
+                # otro error en copy
+                await users_collection.delete_one({"_id": ObjectId(result.inserted_id)})
+                raise HTTPException(status_code=500, detail=f"Remote copy failed: rc={rc} out='{out}' err='{err}'")
+
+        # send confirmation in background (non-blocking)
+        try:
+            asyncio.create_task(send_confirmation(await get_user(await get_username(result.inserted_id))))
+        except Exception:
+            # no bloquear si el envio falla; loggear si tienes logger
+            pass
 
     except paramiko.AuthenticationException:
         await users_collection.delete_one({"_id": ObjectId(result.inserted_id)})
@@ -83,17 +108,16 @@ async def register(user: NewUser):
     except paramiko.SSHException as e:
         await users_collection.delete_one({"_id": ObjectId(result.inserted_id)})
         raise HTTPException(status_code=500, detail=f"SSH error: {str(e)}")
-    except HTTPException:
-        # ya hemos limpiado en los casos anteriores, relanzamos
-        raise
     except Exception as e:
         await users_collection.delete_one({"_id": ObjectId(result.inserted_id)})
         raise HTTPException(status_code=500, detail=f"Remote setup unexpected error: {str(e)}")
     finally:
+            # Si todo va bien devolvemos el id del usuario creado
+        return {"_id": str(result.inserted_id)}
         if ssh:
             try:
                 ssh.close()
-            except Exception:
+            except:
                 pass
 
 @router.delete("/delete")
