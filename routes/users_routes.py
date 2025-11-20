@@ -38,27 +38,63 @@ async def register(user: NewUser):
     user_dict = user.dict()
     user_dict['password'] = password_hash
     result = await users_collection.insert_one(user_dict)
-    with paramiko.SSHClient() as ssh:
+    ssh = None
+    try:
+        # Inicializar SSH con timeout
+        ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(hostname=SSH_HOST_RES, username=SSH_USERNAME_RES, password=SSH_PASSWORD_RES)
-        user_id = await get_user_id( user_dict['username'])
-        directory_commands = f"sudo mkdir -p /var/www/html/beatnow/{user_id}/photo_profile /var/www/html/beatnow/{user_id}/posts"
-        delete_photo = f"sudo cp /var/www/html/res/photo-profile.jpg /var/www/html/beatnow/{user_id}/photo_profile/photo_profile.png"
-        stdin, stdout, stderr = ssh.exec_command(directory_commands)
-        exit_status = stderr.channel.recv_exit_status()
+        # timeout en connect para no bloquear indefinidamente
+        ssh.connect(hostname=SSH_HOST_RES, username=SSH_USERNAME_RES,
+                    password=SSH_PASSWORD_RES, timeout=10, banner_timeout=10, auth_timeout=10)
+
+        user_id = await get_user_id(user_dict['username'])
+        remote_base = f"/var/www/html/beatnow/{user_id}"
+        mkdir_cmd = f"sudo -n mkdir -p {remote_base}/photo_profile {remote_base}/posts"
+        copy_default_cmd = f"sudo -n cp /var/www/html/res/photo-profile.jpg {remote_base}/photo_profile/photo_profile.png"
+
+        # Ejecutar comando de creación de directorios con timeout y leer salida
+        stdin, stdout, stderr = ssh.exec_command(mkdir_cmd, timeout=20)
+        exit_status = stdout.channel.recv_exit_status()
+        stdout_text = stdout.read().decode(errors="ignore").strip()
+        stderr_text = stderr.read().decode(errors="ignore").strip()
+        if exit_status != 0:
+            # cleanup DB y error claro
+            await users_collection.delete_one({"_id": ObjectId(result.inserted_id)})
+            raise HTTPException(status_code=500, detail=f"Remote mkdir failed: exit={exit_status} stdout='{stdout_text}' stderr='{stderr_text}'")
+
+        # Ejecutar copia del fichero por sudo -n
+        stdin, stdout, stderr = ssh.exec_command(copy_default_cmd, timeout=20)
+        exit_status = stdout.channel.recv_exit_status()
+        stdout_text = stdout.read().decode(errors="ignore").strip()
+        stderr_text = stderr.read().decode(errors="ignore").strip()
         if exit_status != 0:
             await users_collection.delete_one({"_id": ObjectId(result.inserted_id)})
-            raise HTTPException(status_code=500, detail="Error creating the folder on the remote server")
-        
-        stdin, stdout, stderr = ssh.exec_command(delete_photo)
-        exit_status = stderr.channel.recv_exit_status()
+            raise HTTPException(status_code=500, detail=f"Remote copy failed: exit={exit_status} stdout='{stdout_text}' stderr='{stderr_text}'")
 
-
-        if exit_status != 0:
-            await users_collection.delete_one({"_id": ObjectId(result.inserted_id)})
-            raise HTTPException(status_code=500, detail="Error creating the default photo on the remote server")
+        # Enviar confirmación (si esto puede bloquear, considera hacerlo en background)
         await send_confirmation(await get_user(await get_username(result.inserted_id)))
-    return {"_id": str(result.inserted_id)}
+
+    except paramiko.AuthenticationException:
+        await users_collection.delete_one({"_id": ObjectId(result.inserted_id)})
+        raise HTTPException(status_code=500, detail="SSH authentication failed")
+    except paramiko.ssh_exception.NoValidConnectionsError:
+        await users_collection.delete_one({"_id": ObjectId(result.inserted_id)})
+        raise HTTPException(status_code=500, detail="No valid SSH connections available")
+    except paramiko.SSHException as e:
+        await users_collection.delete_one({"_id": ObjectId(result.inserted_id)})
+        raise HTTPException(status_code=500, detail=f"SSH error: {str(e)}")
+    except HTTPException:
+        # ya hemos limpiado en los casos anteriores, relanzamos
+        raise
+    except Exception as e:
+        await users_collection.delete_one({"_id": ObjectId(result.inserted_id)})
+        raise HTTPException(status_code=500, detail=f"Remote setup unexpected error: {str(e)}")
+    finally:
+        if ssh:
+            try:
+                ssh.close()
+            except Exception:
+                pass
 
 @router.delete("/delete")
 async def delete_user(current_user: NewUser = Depends(get_current_user), db=Depends(get_database)):
