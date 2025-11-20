@@ -3,7 +3,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.database import Database
 from pymongo.errors import PyMongoError
 from fastapi import HTTPException
-mongo_client = AsyncIOMotorClient('mongodb+srv://beatnow33:Monlau2021!@beatnow.v1mxd4q.mongodb.net/?retryWrites=true&w=majority&appName=BeatNow')
+mongo_client = AsyncIOMotorClient('mongodb+srv://hugogarsan:Hgd452004@cluster0.tbqe7bk.mongodb.net/?appName=Cluster0')
 
 db = mongo_client['BeatNow']
 
