@@ -27,6 +27,101 @@ router = APIRouter()
 # Registro
 @router.post("/register")
 async def register(user: NewUser):
+    # 1) comprobaciones iniciales
+    existing_user = await users_collection.find_one({"username": user.username})
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Username already registered")
+    existing_user = await users_collection.find_one({"email": user.email})
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    # 2) hash de la contraseña y creación preliminar en BD
+    password_hash = bcrypt.hashpw(user.password.encode("utf-8"), bcrypt.gensalt())
+    user_dict = user.dict()
+    # opcional: almacenar como string legible
+    try:
+        user_dict["password"] = password_hash.decode()
+    except Exception:
+        user_dict["password"] = password_hash  # si falla, deja bytes
+
+    result = await users_collection.insert_one(user_dict)
+
+    ssh = None
+    try:
+        # 3) Conexión SSH y creación de carpetas remotas
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(
+            hostname=SSH_HOST_RES,
+            username=SSH_USERNAME_RES,
+            password=SSH_PASSWORD_RES,
+            timeout=15,
+            banner_timeout=15,
+            auth_timeout=15,
+        )
+
+        user_id = await get_user_id(user_dict["username"])
+        remote_base = f"/var/www/html/beatnow/{user_id}"
+        mkdir_cmd = f"sudo -n mkdir -p {remote_base}/photo_profile {remote_base}/posts"
+        copy_remote_default = f"sudo -n cp /var/www/html/res/photo-profile.jpg {remote_base}/photo_profile/photo_profile.png"
+
+        # Ejecutar mkdir
+        stdin, stdout, stderr = ssh.exec_command(mkdir_cmd, timeout=20)
+        rc = stdout.channel.recv_exit_status()
+        out = stdout.read().decode(errors="ignore").strip()
+        err = stderr.read().decode(errors="ignore").strip()
+        if rc != 0:
+            raise RuntimeError(f"Remote mkdir failed: rc={rc} out='{out}' err='{err}'")
+
+        # Intentar copiar fichero remoto por defecto
+        stdin, stdout, stderr = ssh.exec_command(copy_remote_default, timeout=20)
+        rc = stdout.channel.recv_exit_status()
+        out = stdout.read().decode(errors="ignore").strip()
+        err = stderr.read().decode(errors="ignore").strip()
+
+        if rc != 0:
+            # si falta el fichero remoto, subimos uno local por SFTP
+            if "No such file" in err or "cannot stat" in err:
+                sftp = ssh.open_sftp()
+                try:
+                    local_default = "/opt/beatnow-back/static/photo-profile.jpg"
+                    if not os.path.exists(local_default):
+                        raise RuntimeError("Local default profile image missing for upload")
+                    remote_target = f"{remote_base}/photo_profile/photo_profile.png"
+                    sftp.put(local_default, remote_target)
+                finally:
+                    try:
+                        sftp.close()
+                    except Exception:
+                        pass
+            else:
+                raise RuntimeError(f"Remote copy failed: rc={rc} out='{out}' err='{err}'")
+
+        # Enviar comprobación de correo en background (no bloquear)
+        try:
+            asyncio.create_task(send_confirmation(await get_user(await get_username(result.inserted_id))))
+        except Exception:
+            pass
+
+    except Exception as e:
+        # 4) rollback: borrar usuario creado en BD si hubo fallo en la parte remota
+        try:
+            await users_collection.delete_one({"_id": ObjectId(result.inserted_id)})
+        except Exception:
+            pass
+        # Propagar error con detalle
+        raise HTTPException(status_code=500, detail=f"Remote setup unexpected error: {str(e)}")
+    finally:
+        # 5) cerrar ssh si existe
+        if ssh:
+            try:
+                ssh.close()
+            except Exception:
+                pass
+
+    # 6) si todo OK, devolver id del usuario creado (fuera del finally)
+    return {"_id": str(result.inserted_id)}
+
     # Check if the username is already taken
     existing_user = await users_collection.find_one({"username": user.username})
     if existing_user:
@@ -113,10 +208,10 @@ async def register(user: NewUser):
         raise HTTPException(status_code=500, detail=f"Remote setup unexpected error: {str(e)}")
     finally:
             # Si todo va bien devolvemos el id del usuario creado
-        return {"_id": str(result.inserted_id)}
         if ssh:
             try:
                 ssh.close()
+                return {"_id": str(result.inserted_id)}
             except:
                 pass
 
