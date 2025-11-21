@@ -20,13 +20,22 @@ from fastapi.middleware.cors import CORSMiddleware
 # Iniciar la aplicación
 app = FastAPI()
 
+origins = [
+    "https://app-web-mauve.vercel.app",  # frontend producción
+    "http://localhost:3000",              # si tu front en dev corre aquí
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",              # ajusta según tu entorno
+]
+
 # Configurar CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=["*"],
+    allow_origins=origins,      # lista explícita porque allow_credentials=True
+    allow_credentials=True,     # si necesitas cookies / Authorization
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["set-cookie"],  # opcional
+    max_age=600,
 )
 
 # Incluir los routers
