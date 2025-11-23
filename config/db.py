@@ -1,9 +1,11 @@
+import logging
 import os
 from typing import List, Optional
+from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.database import Database
 from pymongo.errors import PyMongoError
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from dotenv import load_dotenv
 
 # Cargar variables del .env
@@ -42,8 +44,9 @@ async def get_database() -> Database:
     return db
 
 # Manejador de errores
-async def handle_database_error(exception: PyMongoError):
-    raise HTTPException(status_code=500, detail="Database error")
+async def handle_database_error(request: Request, exc: PyMongoError):
+    logging.exception("Database error: %s", exc)
+    return JSONResponse(status_code=500, content={"detail": "Database error"})
 
 
 def parse_list(value: Optional[str]) -> Optional[List[str]]:
