@@ -46,7 +46,7 @@ async def get_database() -> Database:
 # Manejador de errores
 async def handle_database_error(request: Request, exc: PyMongoError):
     logging.exception("Database error: %s", exc)
-    return JSONResponse(status_code=500, content={"detail": "Database error " +  MONGODB_URI})
+    return JSONResponse(status_code=500, content={"detail": "Database error "})
 
 
 def parse_list(value: Optional[str]) -> Optional[List[str]]:
