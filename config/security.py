@@ -10,17 +10,18 @@ from config.db import users_collection, post_collection, lyrics_collection
 from datetime import datetime, timedelta
 from model.lyrics_shemas import Lyrics
 from model.user_shemas import NewUser
+from config.settings import settings 
 from config.db import users_collection
 import jwt
 
 
-SSH_USERNAME_RES = "beatnowadmin"
-SSH_PASSWORD_RES = "Monlau20212021!"
-SSH_HOST_RES = "51.91.109.185"
+SSH_USERNAME_RES = settings.SSH_USERNAME
+SSH_PASSWORD_RES = settings.SSH_PASSWORD
+SSH_HOST_RES     = settings.SSH_HOST
 
-SECRET_KEY = "tu_super_secreto" 
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 8000  # Tiempo de expiración del token
+SECRET_KEY = settings.SECRET_KEY
+ALGORITHM = settings.ALGORITHM
+ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
 
 # Configuración de la seguridad y autenticación OAuth2
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
