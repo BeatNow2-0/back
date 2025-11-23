@@ -1,12 +1,31 @@
+import os
 from typing import List, Optional
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.database import Database
 from pymongo.errors import PyMongoError
 from fastapi import HTTPException
-mongo_client = AsyncIOMotorClient('mongodb+srv://hugogarsan:Hgd452004@cluster0.tbqe7bk.mongodb.net/?appName=Cluster0')
+from dotenv import load_dotenv
 
-db = mongo_client['BeatNow']
+# Cargar variables del .env
+load_dotenv()
 
+# Leer las variables
+MONGO_USER = os.getenv("MONGO_USER")
+MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
+MONGO_HOST = os.getenv("MONGO_HOST")
+MONGO_DB = os.getenv("MONGO_DB")
+
+# Construir la URI sin exponer la contraseña en el código
+MONGODB_URI = (
+    f"mongodb+srv://{MONGO_USER}:{MONGO_PASSWORD}"
+    f"@{MONGO_HOST}/{MONGO_DB}?retryWrites=true&w=majority"
+)
+
+# Crear cliente de MongoDB
+mongo_client = AsyncIOMotorClient(MONGODB_URI)
+db = mongo_client[MONGO_DB]
+
+# Colecciones
 users_collection = db['Users']
 post_collection = db['Posts']
 interactions_collection = db['Interactions']
@@ -19,14 +38,15 @@ mail_code_collection = db['MailCode']
 password_reset_collection = db['PasswordReset']
 
 
-
 async def get_database() -> Database:
-    return mongo_client['BeatNow']
-# Manejador de excepciones para errores de base de datos
+    return db
+
+# Manejador de errores
 async def handle_database_error(exception: PyMongoError):
     raise HTTPException(status_code=500, detail="Database error")
 
+
 def parse_list(value: Optional[str]) -> Optional[List[str]]:
-        if value:
-            return value.split(',')
-        return None
+    if value:
+        return value.split(',')
+    return None
