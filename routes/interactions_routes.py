@@ -117,3 +117,53 @@ async def remove_saved(post_id: str, current_user: NewUser = Depends(get_current
     if result.modified_count == 0:
         raise HTTPException(status_code=500, detail="Failed to remove saved publication")
     return {"message": "Saved publication removed successfully"}
+
+
+'''# Quitar dislike a publicación
+@router.post("/undislike/{post_id}")
+async def remove_dislike(post_id: str, current_user: NewUser = Depends(get_current_user), db=Depends(get_database)):
+    await check_post_exists(post_id, db)
+    user_id = await get_user_id(current_user.username)
+    result = await interactions_collection.update_one(
+        {"user_id": user_id, "post_id": post_id},
+        {"$unset": {"dislike_date": ""}}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to remove dislike")
+    return {"message": "Dislike removed successfully"}'''
+
+# Contar el número de likes de una publicación
+#@router.get("/count/likes/{post_id}")
+async def count_likes(post_id: str, db=Depends(get_database)):
+    try:
+        likes_count = await interactions_collection.count_documents({"post_id": post_id, "like_date": {"$exists": True}})
+        return likes_count
+    except Exception as e:
+        print(f"Error al contar los saves: {e}")
+        return 0
+
+
+# Contar el número de publicaciones guardadas
+#@router.get("/count/saved/{post_id}")
+async def count_saved(post_id: str, db=Depends(get_database)):
+    try:
+        saved_count = await interactions_collection.count_documents({"post_id": post_id, "saved_date": {"$exists": True}})
+        return saved_count
+    except Exception as e:
+        print(f"Error al contar los saves: {e}")
+        return 0
+
+'''# Contar el número de dislikes de una publicación
+#@router.get("/count/dislikes/{post_id}")
+async def count_dislikes(post_id: str, db=Depends(get_database)):
+    try:
+        dislikes_count = await interactions_collection.count_documents({"post_id": post_id, "dislike_date": {"$exists": True}})
+        return  dislikes_count
+    except Exception as e:
+        print(f"Error al contar los saves: {e}")
+        return 0'''
+'''
+@router.get("/protected-route")
+async def protected_route(current_user: NewUser = Security(decode_token, scopes=["base"])):
+    return {"message": "Hello, secured world!", "user": current_user.username}
+'''
