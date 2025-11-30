@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from datetime import datetime
 from bson import ObjectId
 from pymongo import ReturnDocument
-from config.db import get_database, interactions_collection, posts_collection  # asegúrate que posts_collection esté exportado si lo necesitas
+from config.db import get_database, interactions_collection, post_collection  # asegúrate que posts_collection esté exportado si lo necesitas
 from config.security import get_current_user, get_user_id, check_post_exists
 from model.user_shemas import NewUser
 
