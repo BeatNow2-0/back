@@ -17,8 +17,7 @@ def _normalize_post_id(post_id: str):
     return post_id
 
 
-async def check_interaction_exists(user_id: str, post_id: str, field: str):
-    """Lanza 400 si la interacción ya existe (p.ej. like_date ya existe)."""
+async def check_interaction_exists(user_id: str, post_id: str, field: str, db):
     post_key = _normalize_post_id(post_id)
     interaction = await interactions_collection.find_one({"user_id": user_id, "post_id": post_key})
     if interaction and field in interaction and interaction.get(field) is not None:
@@ -26,8 +25,7 @@ async def check_interaction_exists(user_id: str, post_id: str, field: str):
     return
 
 
-async def check_uninteraction_exists(user_id: str, post_id: str, field: str):
-    """Lanza 400 si la interacción NO existe (p.ej. intentar quitar un like que no existe)."""
+async def check_uninteraction_exists(user_id: str, post_id: str, field: str, db):
     post_key = _normalize_post_id(post_id)
     interaction = await interactions_collection.find_one({"user_id": user_id, "post_id": post_key})
     if not interaction or field not in interaction or interaction.get(field) is None:
@@ -35,15 +33,14 @@ async def check_uninteraction_exists(user_id: str, post_id: str, field: str):
     return
 
 
-# Ruta para añadir like
 @router.post("/like/{post_id}")
-async def add_like(post_id: str, current_user: NewUser = Depends(get_current_user)):
-    await check_post_exists(post_id)  # deja que lance 404 si no existe
+async def add_like(post_id: str, current_user: NewUser = Depends(get_current_user), db=Depends(get_database)):
+    # Ahora pasamos db a check_post_exists
+    await check_post_exists(post_id, db)
     user_id = await get_user_id(current_user.username)
-    await check_interaction_exists(user_id, post_id, "like_date")
+    await check_interaction_exists(user_id, post_id, "like_date", db)
 
     post_key = _normalize_post_id(post_id)
-    # Usamos find_one_and_update para devolver el documento después del update si queremos
     result_doc = await interactions_collection.find_one_and_update(
         {"user_id": user_id, "post_id": post_key},
         {"$set": {"like_date": datetime.utcnow()}},
@@ -51,20 +48,17 @@ async def add_like(post_id: str, current_user: NewUser = Depends(get_current_use
         return_document=ReturnDocument.AFTER
     )
 
-    # Debug - imprime estado
-    # print("DBG like result_doc:", result_doc)
-
     if not result_doc:
         raise HTTPException(status_code=500, detail="Failed to add like")
     return {"message": "Like added successfully", "interaction": result_doc}
 
 
-# Ruta para quitar like
+
 @router.delete("/unlike/{post_id}")
-async def remove_like(post_id: str, current_user: NewUser = Depends(get_current_user)):
-    await check_post_exists(post_id)
+async def remove_like(post_id: str, current_user: NewUser = Depends(get_current_user), db=Depends(get_database)):
+    await check_post_exists(post_id, db)
     user_id = await get_user_id(current_user.username)
-    await check_uninteraction_exists(user_id, post_id, "like_date")
+    await check_uninteraction_exists(user_id, post_id, "like_date", db)
 
     post_key = _normalize_post_id(post_id)
     result = await interactions_collection.update_one(
@@ -72,21 +66,17 @@ async def remove_like(post_id: str, current_user: NewUser = Depends(get_current_
         {"$unset": {"like_date": ""}}
     )
 
-    # Debug:
-    # print("DBG unlike update result:", result.raw_result)
-
     if result.modified_count == 0:
-        # Si no modificó nada, puede que no existiera (debería haber sido capturado por check_uninteraction_exists)
         raise HTTPException(status_code=500, detail="Failed to remove like")
     return {"message": "Like removed successfully"}
 
 
 # Save (guardar post)
 @router.post("/save/{post_id}")
-async def save_publication(post_id: str, current_user: NewUser = Depends(get_current_user)):
-    await check_post_exists(post_id)
+async def save_publication(post_id: str, current_user: NewUser = Depends(get_current_user), db=Depends(get_database)):
+    await check_post_exists(post_id, db)
     user_id = await get_user_id(current_user.username)
-    await check_interaction_exists(user_id, post_id, "saved_date")
+    await check_interaction_exists(user_id, post_id, "saved_date", db)
 
     post_key = _normalize_post_id(post_id)
     result_doc = await interactions_collection.find_one_and_update(
@@ -101,12 +91,11 @@ async def save_publication(post_id: str, current_user: NewUser = Depends(get_cur
     return {"message": "Publication saved successfully", "interaction": result_doc}
 
 
-# Unsave
 @router.delete("/unsave/{post_id}")
-async def remove_saved(post_id: str, current_user: NewUser = Depends(get_current_user)):
-    await check_post_exists(post_id)
+async def remove_saved(post_id: str, current_user: NewUser = Depends(get_current_user), db=Depends(get_database)):
+    await check_post_exists(post_id, db)
     user_id = await get_user_id(current_user.username)
-    await check_uninteraction_exists(user_id, post_id, "saved_date")
+    await check_uninteraction_exists(user_id, post_id, "saved_date", db)
 
     post_key = _normalize_post_id(post_id)
     result = await interactions_collection.update_one(
