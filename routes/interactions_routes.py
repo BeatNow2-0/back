@@ -122,28 +122,30 @@ async def add_like(post_id: str, current_user: NewUser = Depends(get_current_use
         resp["note"] = "Post not updated directly (possible _id type mismatch)."
     return resp
 
-
 @router.delete("/unlike/{post_id}")
 async def remove_like(post_id: str, current_user: NewUser = Depends(get_current_user), db=Depends(get_database)):
     await check_post_exists(post_id, db)
     user_id = await get_user_id(current_user.username)
-    await check_uninteraction_exists(user_id, post_id, "like_date", db)
-
     post_key = _normalize_post_id(post_id)
-    result = await interactions_collection.update_one(
-        {"user_id": user_id, "post_id": post_key},
-        {"$unset": {"like_date": ""}}
+
+    # Intentamos obtener el documento *antes* de quitar el like; sólo si existía lo quitamos
+    prev = await interactions_collection.find_one_and_update(
+        {"user_id": user_id, "post_id": post_key, "like_date": {"$exists": True}},
+        {"$unset": {"like_date": ""}},
+        return_document=ReturnDocument.BEFORE
     )
 
-    if result.modified_count == 0:
-        raise HTTPException(status_code=500, detail="Failed to remove like interaction")
+    if not prev:
+        # no había like que quitar
+        raise HTTPException(status_code=400, detail="Like does not exist")
 
-    # decrementar contador de likes en post_collection
+    # Si llegamos aquí, sí había like; ahora decrementamos en post_collection
     updated_post, used_key = await _inc_post_field(post_id, "likes", -1)
     if updated_post is None:
+        # log warning pero devolvemos la interacción quitada
         print(f"[remove_like] Warning: could not decrement likes on post_collection for post_id={post_id}")
 
-    resp = {"message": "Like removed successfully"}
+    resp = {"message": "Like removed successfully", "interaction_prev": jsonable_encoder(prev, custom_encoder={ObjectId: str})}
     if updated_post:
         resp["post"] = jsonable_encoder(updated_post, custom_encoder={ObjectId: str})
         resp["used_key"] = used_key
@@ -191,29 +193,29 @@ async def save_publication(post_id: str, current_user: NewUser = Depends(get_cur
 async def remove_saved(post_id: str, current_user: NewUser = Depends(get_current_user), db=Depends(get_database)):
     await check_post_exists(post_id, db)
     user_id = await get_user_id(current_user.username)
-    await check_uninteraction_exists(user_id, post_id, "saved_date", db)
-
     post_key = _normalize_post_id(post_id)
-    result = await interactions_collection.update_one(
-        {"user_id": user_id, "post_id": post_key},
-        {"$unset": {"saved_date": ""}}
+
+    prev = await interactions_collection.find_one_and_update(
+        {"user_id": user_id, "post_id": post_key, "saved_date": {"$exists": True}},
+        {"$unset": {"saved_date": ""}},
+        return_document=ReturnDocument.BEFORE
     )
 
-    if result.modified_count == 0:
-        raise HTTPException(status_code=500, detail="Failed to remove saved publication interaction")
+    if not prev:
+        raise HTTPException(status_code=400, detail="Save does not exist")
 
-    # decrementar contador saves en post_collection
     updated_post, used_key = await _inc_post_field(post_id, "saves", -1)
     if updated_post is None:
         print(f"[remove_saved] Warning: could not decrement saves on post_collection for post_id={post_id}")
 
-    resp = {"message": "Saved publication removed successfully"}
+    resp = {"message": "Saved publication removed successfully", "interaction_prev": jsonable_encoder(prev, custom_encoder={ObjectId: str})}
     if updated_post:
         resp["post"] = jsonable_encoder(updated_post, custom_encoder={ObjectId: str})
         resp["used_key"] = used_key
     else:
         resp["note"] = "Post not updated directly (possible _id type mismatch)."
     return resp
+
 
 
 # -----------------------
