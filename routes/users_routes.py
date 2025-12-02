@@ -367,40 +367,105 @@ async def delete_photo_profile(current_user: NewUser = Depends(get_current_user)
 
 
 @router.put("/change_photo_profile")
-async def change_photo_profile(file: UploadFile = File(...), current_user: NewUser = Depends(get_current_user)):
+async def change_photo_profile(
+    file: UploadFile = File(...),
+    current_user: NewUser = Depends(get_current_user)
+):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     user_id = await get_user_id(current_user.username)
+    if not user_id:
+        raise HTTPException(status_code=404, detail="User id not found")
+
     user_photo_dir = f"/var/www/html/beatnow/{user_id}/photo_profile"
+    remote_filename = "photo_profile.png"
+    remote_path = os.path.join(user_photo_dir, remote_filename)
 
     try:
-        # SSH connection
         with paramiko.SSHClient() as ssh:
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(
-                hostname=SSH_HOST_RES,
-                username=SSH_USERNAME_RES,
-                password=SSH_PASSWORD_RES
-            )
+            ssh.connect(hostname=SSH_HOST_RES, username=SSH_USERNAME_RES, password=SSH_PASSWORD_RES, timeout=20)
 
-            # Create folder if not exists
-            ssh.exec_command(f"mkdir -p {user_photo_dir}")
-
-            # Remove old photos
-            ssh.exec_command(f"rm -rf {user_photo_dir}/*")
-
-            # Upload new file via SFTP
+            # --- Use SFTP for directory creation / cleaning / upload ---
             sftp = ssh.open_sftp()
-            remote_path = f"{user_photo_dir}/photo_profile.png"
+
+            # create dirs if not exists (walk parents)
+            try:
+                # try to stat user_photo_dir; if fails, create
+                sftp.stat(user_photo_dir)
+            except IOError:
+                # create intermediate dirs
+                parent = f"/var/www/html/beatnow/{user_id}"
+                try:
+                    sftp.mkdir(parent)
+                except IOError:
+                    # ignore if exists
+                    pass
+                try:
+                    sftp.mkdir(user_photo_dir)
+                except IOError:
+                    # ignore if exists
+                    pass
+
+            # Clear existing files inside the photo_profile directory safely
+            try:
+                for name in sftp.listdir(user_photo_dir):
+                    path_to_remove = user_photo_dir + "/" + name
+                    try:
+                        sftp.remove(path_to_remove)
+                    except IOError:
+                        # if it's a directory, attempt rmdir (shouldn't be)
+                        try:
+                            sftp.rmdir(path_to_remove)
+                        except Exception:
+                            # ignore individual remove errors but log
+                            pass
+            except IOError:
+                # Directory might still be missing or unreadable; attempt to create it
+                try:
+                    sftp.mkdir(user_photo_dir)
+                except Exception:
+                    pass
+
+            # Upload new file
+            # ensure we start from beginning of file
+            await file.seek(0)
+            # read content into memory (ok for profile pics)
+            content = await file.read()
+            import io
+            file_obj = io.BytesIO(content)
+            file_obj.seek(0)
+
             with sftp.open(remote_path, "wb") as dst:
-                shutil.copyfileobj(file.file, dst)
+                shutil.copyfileobj(file_obj, dst)
+
+            # Set file permissions (rw-r--r--)
+            try:
+                sftp.chmod(remote_path, 0o644)
+            except Exception:
+                pass
+
+            # Ensure directory permissions are ok (rwxr-xr-x)
+            try:
+                sftp.chmod(user_photo_dir, 0o755)
+            except Exception:
+                pass
+
             sftp.close()
 
+    except paramiko.AuthenticationException:
+        raise HTTPException(status_code=500, detail="SSH authentication failed")
+    except paramiko.SSHException as e:
+        raise HTTPException(status_code=500, detail=f"SSH error: {str(e)}")
     except Exception as e:
+        # bubble up filesystem permission issue or others
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
-    return {"message": "Photo profile updated successfully"}
+    return {
+        "message": "Photo profile updated successfully",
+        "path": f"https://51.91.109.185/beatnow/{user_id}/photo_profile/{remote_filename}"
+    }
 
 
 @router.put("/update")
