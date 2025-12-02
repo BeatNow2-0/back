@@ -1,6 +1,8 @@
 from datetime import timedelta
 import asyncio
+import io
 import os
+import traceback
 from typing import Annotated, List
 import shutil
 from bson import ObjectId
@@ -365,7 +367,6 @@ async def delete_photo_profile(current_user: NewUser = Depends(get_current_user)
 
     return {"message": "Photo profile deleted successfully"}
 
-
 @router.put("/change_photo_profile")
 async def change_photo_profile(
     file: UploadFile = File(...),
@@ -383,70 +384,68 @@ async def change_photo_profile(
     remote_path = os.path.join(user_photo_dir, remote_filename)
 
     try:
+        # Leemos TODO el contenido al principio (evita usar file.file ya leído)
+        content = await file.read()
+        # opcional: tamaño máximo
+        MAX = 6 * 1024 * 1024
+        if len(content) > MAX:
+            raise HTTPException(status_code=413, detail="File too large")
+
+        # convertimos a BytesIO para SFTP write
+        buf = io.BytesIO(content)
+        buf.seek(0)
+
         with paramiko.SSHClient() as ssh:
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             ssh.connect(hostname=SSH_HOST_RES, username=SSH_USERNAME_RES, password=SSH_PASSWORD_RES, timeout=20)
 
-            # --- Use SFTP for directory creation / cleaning / upload ---
             sftp = ssh.open_sftp()
 
-            # create dirs if not exists (walk parents)
+            # crear dir si no existe (con SFTP)
             try:
-                # try to stat user_photo_dir; if fails, create
                 sftp.stat(user_photo_dir)
             except IOError:
-                # create intermediate dirs
-                parent = f"/var/www/html/beatnow/{user_id}"
-                try:
-                    sftp.mkdir(parent)
-                except IOError:
-                    # ignore if exists
-                    pass
-                try:
-                    sftp.mkdir(user_photo_dir)
-                except IOError:
-                    # ignore if exists
-                    pass
+                # create parents safely
+                parts = user_photo_dir.strip("/").split("/")
+                accum = ""
+                for p in parts:
+                    accum = "/" + os.path.join(accum.lstrip("/"), p) if accum else "/" + p
+                    try:
+                        sftp.stat(accum)
+                    except IOError:
+                        try:
+                            sftp.mkdir(accum)
+                        except Exception:
+                            # ignore minor race conditions
+                            pass
 
-            # Clear existing files inside the photo_profile directory safely
+            # limpiar archivos existentes (usando sftp.remove)
             try:
                 for name in sftp.listdir(user_photo_dir):
                     path_to_remove = user_photo_dir + "/" + name
                     try:
                         sftp.remove(path_to_remove)
                     except IOError:
-                        # if it's a directory, attempt rmdir (shouldn't be)
+                        # si falla remove, intenta rmdir (por si hay subdir)
                         try:
                             sftp.rmdir(path_to_remove)
                         except Exception:
-                            # ignore individual remove errors but log
+                            # registrar y continuar
                             pass
             except IOError:
-                # Directory might still be missing or unreadable; attempt to create it
-                try:
-                    sftp.mkdir(user_photo_dir)
-                except Exception:
-                    pass
+                # no listar (tal vez no existe) -> ignore
+                pass
 
-            # Upload new file
-            # ensure we start from beginning of file
-            await file.seek(0)
-            # read content into memory (ok for profile pics)
-            content = await file.read()
-            import io
-            file_obj = io.BytesIO(content)
-            file_obj.seek(0)
-
+            # subir el archivo desde buffer
+            buf.seek(0)
             with sftp.open(remote_path, "wb") as dst:
-                shutil.copyfileobj(file_obj, dst)
+                shutil.copyfileobj(buf, dst)
 
-            # Set file permissions (rw-r--r--)
+            # asegurar permisos: archivo 644, dir 755
             try:
                 sftp.chmod(remote_path, 0o644)
             except Exception:
                 pass
-
-            # Ensure directory permissions are ok (rwxr-xr-x)
             try:
                 sftp.chmod(user_photo_dir, 0o755)
             except Exception:
@@ -454,13 +453,14 @@ async def change_photo_profile(
 
             sftp.close()
 
-    except paramiko.AuthenticationException:
-        raise HTTPException(status_code=500, detail="SSH authentication failed")
-    except paramiko.SSHException as e:
-        raise HTTPException(status_code=500, detail=f"SSH error: {str(e)}")
+    except HTTPException:
+        # re-throw errores intencionados
+        raise
     except Exception as e:
-        # bubble up filesystem permission issue or others
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+        # DEV DEBUG: devuelve traceback para localizar la operación concreta que falla
+        tb = traceback.format_exc()
+        # Quitar este detalle en producción
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}\nTRACE:\n{tb}")
 
     return {
         "message": "Photo profile updated successfully",
