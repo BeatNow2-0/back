@@ -7,7 +7,6 @@ from pymongo import ReturnDocument
 from config.db import get_database, interactions_collection, post_collection
 from config.security import get_current_user, get_user_id, check_post_exists
 from model.user_shemas import NewUser
-from model.post_shemas import Post
 
 router = APIRouter()
 
