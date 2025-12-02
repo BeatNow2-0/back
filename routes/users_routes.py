@@ -467,3 +467,33 @@ async def check_email(email: str):
     if existing_user:
         return {"status": "ko", "detail": "Email already registered"}
     return {"status": "ok", "detail": "Email is available"}
+
+@router.put("/change_password")
+async def change_password(
+    current_password: str,
+    new_password: str,
+    current_user: NewUser = Depends(get_current_user)
+):
+    # 1) Obtener usuario desde BD
+    user_dict = await users_collection.find_one({"username": current_user.username})
+    if not user_dict:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # 2) Verificar contraseña actual
+    stored_hash = user_dict["password"]
+    if not verify_password(current_password, stored_hash):
+        raise HTTPException(status_code=400, detail="Incorrect current password")
+
+    # 3) Hashear nueva contraseña
+    new_hash = hash_password(new_password)
+
+    # 4) Guardar en BD
+    result = await users_collection.update_one(
+        {"_id": ObjectId(user_dict["_id"])},
+        {"$set": {"password": new_hash}}
+    )
+
+    if result.modified_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to update password")
+
+    return {"message": "Password updated successfully"}
