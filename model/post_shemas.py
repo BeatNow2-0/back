@@ -22,7 +22,17 @@ class Post(NewPost):
     cover_format: str = Field(alias="cover_format")
     likes: int = Field(alias="likes")
     saves: int = Field(alias="saves")
-    #beat_info: MusicBase._id = Field(alias="beat_info")
+    views: int = Field(alias="views", default=0)
+
+    @validator("views", pre=True, always=True)
+    def normalize_views(cls, v):
+        # si no viene, lo colocamos a 0; si viene como string lo convertimos a int
+        if v is None:
+            return 0
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
 
 class PostInDB(Post):
     id: Optional[str] = Field(default=None, alias='_id')
@@ -49,6 +59,7 @@ class ProfilePost(BaseModel):
     id: str = Field(alias="_id")
     title: str = Field(alias="title")
     description: str = Field(alias="description")
+    views: Optional[int] = Field(default=0, alias="views")
 
 class Tag(BaseModel):
     name: str = Field(alias="name")
