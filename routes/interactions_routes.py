@@ -19,6 +19,50 @@ def _normalize_post_id(post_id: str):
     return post_id
 
 
+# ------------- Helper para actualizar post_collection probando ObjectId/string -------------
+async def _inc_post_field(post_id: str, field: str, amount: int = 1):
+    """
+    Incrementa el campo `field` en post_collection probando ambos tipos de _id:
+      1) ObjectId(post_id) (si post_id tiene 24 hex chars)
+      2) post_id como string
+    Devuelve (updated_post_dict_or_None, used_key_type_string_or_None)
+    """
+    update_doc = {"$inc": {field: amount}}
+    # 1) intentar ObjectId si parece hex de 24
+    try:
+        if isinstance(post_id, str) and len(post_id) == 24:
+            try:
+                oid = ObjectId(post_id)
+                updated = await post_collection.find_one_and_update(
+                    {"_id": oid},
+                    update_doc,
+                    return_document=ReturnDocument.AFTER
+                )
+                if updated:
+                    return updated, "objectid"
+            except Exception as e:
+                # fallo conversión o query con ObjectId -> seguimos intentando con string
+                print(f"[_inc_post_field] intento ObjectId failed for {post_id}: {e}")
+    except Exception as e:
+        print(f"[_inc_post_field] unexpected error on ObjectId attempt: {e}")
+
+    # 2) intentar con string
+    try:
+        updated = await post_collection.find_one_and_update(
+            {"_id": post_id},
+            update_doc,
+            return_document=ReturnDocument.AFTER
+        )
+        if updated:
+            return updated, "string"
+    except Exception as e:
+        print(f"[_inc_post_field] intento string failed for {post_id}: {e}")
+
+    # No se pudo actualizar el post (ni como objectid ni como string)
+    return None, None
+
+
+# ------------- comprobaciones de interacción -------------
 async def check_interaction_exists(user_id: str, post_id: str, field: str, db):
     """
     Lanza 400 si la interacción ya existe (por ejemplo: like_date ya existe).
@@ -41,6 +85,9 @@ async def check_uninteraction_exists(user_id: str, post_id: str, field: str, db)
     return
 
 
+# -----------------------
+# LIKE / UNLIKE
+# -----------------------
 @router.post("/like/{post_id}")
 async def add_like(post_id: str, current_user: NewUser = Depends(get_current_user), db=Depends(get_database)):
     # Validar existencia del post
@@ -61,23 +108,18 @@ async def add_like(post_id: str, current_user: NewUser = Depends(get_current_use
     if not result_doc:
         raise HTTPException(status_code=500, detail="Failed to add like interaction")
 
-    # 2) incrementar contador de likes en post_collection de forma atómica
-    try:
-        # si tu post._id es ObjectId, asegúrate de que post_key sea ObjectId(post_id)
-        updated_post = await post_collection.find_one_and_update(
-            {"_id": post_key},
-            {"$inc": {"likes": 1}},
-            return_document=ReturnDocument.AFTER
-        )
-    except Exception as e:
-        # Log y devolvemos la interacción aunque la actualización del post falle
-        print(f"Warning: failed to increment post.likes for {post_id}: {e}")
-        updated_post = None
+    # 2) incrementar contador de likes en post_collection de forma atómica (intentando objectId/string)
+    updated_post, used_key = await _inc_post_field(post_id, "likes", 1)
+    if updated_post is None:
+        print(f"[add_like] Warning: could not increment likes on post_collection for post_id={post_id}")
 
     safe_interaction = jsonable_encoder(result_doc, custom_encoder={ObjectId: str})
     resp = {"message": "Like added successfully", "interaction": safe_interaction}
     if updated_post:
         resp["post"] = jsonable_encoder(updated_post, custom_encoder={ObjectId: str})
+        resp["used_key"] = used_key
+    else:
+        resp["note"] = "Post not updated directly (possible _id type mismatch)."
     return resp
 
 
@@ -97,23 +139,22 @@ async def remove_like(post_id: str, current_user: NewUser = Depends(get_current_
         raise HTTPException(status_code=500, detail="Failed to remove like interaction")
 
     # decrementar contador de likes en post_collection
-    try:
-        updated_post = await post_collection.find_one_and_update(
-            {"_id": post_key},
-            {"$inc": {"likes": -1}},
-            return_document=ReturnDocument.AFTER
-        )
-    except Exception as e:
-        print(f"Warning: failed to decrement post.likes for {post_id}: {e}")
-        updated_post = None
+    updated_post, used_key = await _inc_post_field(post_id, "likes", -1)
+    if updated_post is None:
+        print(f"[remove_like] Warning: could not decrement likes on post_collection for post_id={post_id}")
 
     resp = {"message": "Like removed successfully"}
     if updated_post:
         resp["post"] = jsonable_encoder(updated_post, custom_encoder={ObjectId: str})
+        resp["used_key"] = used_key
+    else:
+        resp["note"] = "Post not updated directly (possible _id type mismatch)."
     return resp
 
 
-# Save (guardar post)
+# -----------------------
+# SAVE / UNSAVE
+# -----------------------
 @router.post("/save/{post_id}")
 async def save_publication(post_id: str, current_user: NewUser = Depends(get_current_user), db=Depends(get_database)):
     await check_post_exists(post_id, db)
@@ -132,20 +173,17 @@ async def save_publication(post_id: str, current_user: NewUser = Depends(get_cur
         raise HTTPException(status_code=500, detail="Failed to save publication interaction")
 
     # incrementar contador saves en post_collection
-    try:
-        updated_post = await post_collection.find_one_and_update(
-            {"_id": post_key},
-            {"$inc": {"saves": 1}},
-            return_document=ReturnDocument.AFTER
-        )
-    except Exception as e:
-        print(f"Warning: failed to increment post.saves for {post_id}: {e}")
-        updated_post = None
+    updated_post, used_key = await _inc_post_field(post_id, "saves", 1)
+    if updated_post is None:
+        print(f"[save_publication] Warning: could not increment saves on post_collection for post_id={post_id}")
 
     safe_doc = jsonable_encoder(result_doc, custom_encoder={ObjectId: str})
     resp = {"message": "Publication saved successfully", "interaction": safe_doc}
     if updated_post:
         resp["post"] = jsonable_encoder(updated_post, custom_encoder={ObjectId: str})
+        resp["used_key"] = used_key
+    else:
+        resp["note"] = "Post not updated directly (possible _id type mismatch)."
     return resp
 
 
@@ -165,23 +203,22 @@ async def remove_saved(post_id: str, current_user: NewUser = Depends(get_current
         raise HTTPException(status_code=500, detail="Failed to remove saved publication interaction")
 
     # decrementar contador saves en post_collection
-    try:
-        updated_post = await post_collection.find_one_and_update(
-            {"_id": post_key},
-            {"$inc": {"saves": -1}},
-            return_document=ReturnDocument.AFTER
-        )
-    except Exception as e:
-        print(f"Warning: failed to decrement post.saves for {post_id}: {e}")
-        updated_post = None
+    updated_post, used_key = await _inc_post_field(post_id, "saves", -1)
+    if updated_post is None:
+        print(f"[remove_saved] Warning: could not decrement saves on post_collection for post_id={post_id}")
 
     resp = {"message": "Saved publication removed successfully"}
     if updated_post:
         resp["post"] = jsonable_encoder(updated_post, custom_encoder={ObjectId: str})
+        resp["used_key"] = used_key
+    else:
+        resp["note"] = "Post not updated directly (possible _id type mismatch)."
     return resp
 
 
-# Contar el número de likes de una publicación
+# -----------------------
+# Contadores auxiliares
+# -----------------------
 async def count_likes(post_id: str, db=Depends(get_database)):
     try:
         post_key = _normalize_post_id(post_id)
@@ -192,7 +229,6 @@ async def count_likes(post_id: str, db=Depends(get_database)):
         return 0
 
 
-# Contar el número de publicaciones guardadas
 async def count_saved(post_id: str, db=Depends(get_database)):
     try:
         post_key = _normalize_post_id(post_id)
@@ -260,20 +296,14 @@ async def add_view(post_id: str, current_user: NewUser = Depends(get_current_use
 
         total_views = None
         updated_post = None
+        used_key = None
         if should_count_view:
             # 4) incrementamos en post_collection el contador de views (operación atómica)
-            # Si tu post._id es ObjectId, asegúrate de usar ObjectId() en post_key
-            updated_post = await post_collection.find_one_and_update(
-                {"_id": post_key},
-                {"$inc": {"views": 1}},
-                return_document=ReturnDocument.AFTER
-            )
-            # Si no usas campo views en post_collection, podrías contar desde interactions_collection
-            # total_views = await interactions_collection.count_documents({"post_id": post_key, "last_view": {"$exists": True}})
+            updated_post, used_key = await _inc_post_field(post_id, "views", 1)
             if updated_post:
                 total_views = updated_post.get("views", None)
             else:
-                # si por alguna razón no actualizamos post_collection, intenta leer contador por interacciones
+                # fallback: contar por interacciones
                 total_views = await interactions_collection.count_documents({"post_id": post_key, "last_view": {"$exists": True}})
 
         # devolver una respuesta útil
@@ -282,6 +312,9 @@ async def add_view(post_id: str, current_user: NewUser = Depends(get_current_use
             resp["total_views"] = total_views
         if updated_post:
             resp["post"] = jsonable_encoder(updated_post, custom_encoder={ObjectId: str})
+            resp["used_key"] = used_key
+        else:
+            resp["note"] = "Post not updated directly (possible _id type mismatch)."
 
         return resp
 
@@ -300,10 +333,26 @@ async def count_views(post_id: str, db=Depends(get_database)):
     """
     try:
         post_key = _normalize_post_id(post_id)
+
+        # intentar ObjectId y string para leer post
+        try:
+            if isinstance(post_key, str) and len(post_key) == 24:
+                try:
+                    oid = ObjectId(post_key)
+                    post_doc = await post_collection.find_one({"_id": oid})
+                    if post_doc and isinstance(post_doc.get("views"), int):
+                        return post_doc.get("views", 0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # fallback con string
         post_doc = await post_collection.find_one({"_id": post_key})
         if post_doc and isinstance(post_doc.get("views"), int):
             return post_doc.get("views", 0)
-        # fallback: contar interacciones con last_view
+
+        # fallback final: contar interacciones
         views_count = await interactions_collection.count_documents({"post_id": post_key, "last_view": {"$exists": True}})
         return views_count
     except Exception as e:
