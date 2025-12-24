@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI()
 
 origins = [
-    "https://app-web-mauve.vercel.app",  # frontend producción
+    "https://app.beatnow.app",  # frontend producción
     "http://localhost:3000",              # si tu front en dev corre aquí
     "http://127.0.0.1:3000",
     "http://localhost:5173",              # ajusta según tu entorno
