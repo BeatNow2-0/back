@@ -1,126 +1,197 @@
-from typing import Annotated, Optional
-from bson import ObjectId
-from fastapi import Depends, HTTPException,status
-from fastapi.security import OAuth2PasswordBearer
-from jwt import PyJWTError
-from passlib.context import CryptContext
+from __future__ import annotations
+
 import logging
-from prometheus_client import Counter
-from config.db import users_collection, post_collection, lyrics_collection
-from datetime import datetime, timedelta
-from model.lyrics_shemas import Lyrics
-from model.user_shemas import NewUser
-from config.settings import settings 
-from config.db import users_collection
+import secrets
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Optional
+from uuid import uuid4
+
 import jwt
+from bson import ObjectId
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jwt import ExpiredSignatureError, PyJWTError
+from passlib.context import CryptContext
 
+from config.db import post_collection, refresh_tokens_collection, users_collection
+from config.settings import settings
+from model.user_shemas import CurrentUser, NewUser
 
-SSH_USERNAME_RES = settings.SSH_USERNAME
-SSH_PASSWORD_RES = settings.SSH_PASSWORD
-SSH_HOST_RES     = settings.SSH_HOST
+logger = logging.getLogger(__name__)
 
-SECRET_KEY = settings.SECRET_KEY
-ALGORITHM = settings.ALGORITHM
-ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
-
-# Configuración de la seguridad y autenticación OAuth2
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
- 
-# Configuración de logs
-logging.basicConfig(filename='app.log', level=logging.INFO)
- 
-# Configuración de Prometheus
-requests_counter = Counter('requests_total', 'Total number of requests')
 
-async def get_user(username: str) -> Optional[NewUser]:
-    try:
-        user = await users_collection.find_one({"username": username})
-        if user:
-            return NewUser(**user)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Database error")
-
-async def decode_token(token: str) -> Optional[NewUser]:
-    try:
-        # Decodifica el token y valida
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        user = await get_user(username)
-        if user is None:
-            raise HTTPException(status_code=404, detail="User not found")
-        return user
-    except PyJWTError:
-        raise HTTPException(status_code=403, detail="Could not validate credentials")
+SECRET_KEY = settings.secret_key
+ALGORITHM = settings.algorithm
+ACCESS_TOKEN_EXPIRE_MINUTES = settings.access_token_expire_minutes
+REFRESH_TOKEN_EXPIRE_MINUTES = settings.refresh_token_expire_minutes
+PASSWORD_RESET_EXPIRE_MINUTES = settings.password_reset_expire_minutes
+CONFIRMATION_CODE_EXPIRE_MINUTES = settings.confirmation_code_expire_minutes
 
 
-async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
-    user = await decode_token(token)  # Ensure this is awaited
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="Inactive user")
-    return user
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
 
-async def get_current_user_without_confirmation(token: Annotated[str, Depends(oauth2_scheme)]):
-    user = await decode_token(token)  # Ensure this is awaited
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return user
 
-async def get_user_id(username: str):
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+async def get_user(username: str) -> Optional[CurrentUser]:
     user = await users_collection.find_one({"username": username})
     if user:
-        return str(user["_id"])
-    else:
-        return "Usuario no encontrado" 
-async def get_post_id_saved(_id: str):
-    lyric = await post_collection.find_one({"_id": ObjectId(_id)})
-    if lyric:
-        return str(lyric["user_id"])
-    else:
-        return "Lyric no encontrado" 
+        return CurrentUser(**user)
+    return None
 
-async def get_lyric_id(lyric: Lyrics):
-    lyric = await lyrics_collection.find_one({lyric.dict()})
-    if lyric:
-        return str(user["_id"])
-    else:
-        return "Lyric no encontrado" 
-    
-async def get_username(user_id: str):
-    user = await users_collection.find_one({"_id": ObjectId(user_id)})
+
+async def get_user_by_email(email: str) -> Optional[CurrentUser]:
+    user = await users_collection.find_one({"email": email})
     if user:
-        return user["username"]
-    else:
-        return "Usuario no encontrado"
+        return CurrentUser(**user)
+    return None
 
-async def check_post_exists(post_id: str, db):
-    existing_post = await post_collection.find_one({"_id": ObjectId(post_id)})
-    if not existing_post:
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def create_access_token(subject: str) -> str:
+    now = _utcnow()
+    payload = {
+        "sub": subject,
+        "type": "access",
+        "iat": int(now.timestamp()),
+        "nbf": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)).timestamp()),
+        "iss": settings.app_name,
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+async def create_refresh_token(subject: str) -> tuple[str, str]:
+    now = _utcnow()
+    jti = str(uuid4())
+    payload = {
+        "sub": subject,
+        "jti": jti,
+        "type": "refresh",
+        "iat": int(now.timestamp()),
+        "nbf": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=REFRESH_TOKEN_EXPIRE_MINUTES)).timestamp()),
+        "iss": settings.app_name,
+    }
+    token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    await refresh_tokens_collection.insert_one(
+        {
+            "jti": jti,
+            "username": subject,
+            "created_at": now,
+            "expires_at": now + timedelta(minutes=REFRESH_TOKEN_EXPIRE_MINUTES),
+            "revoked": False,
+        }
+    )
+    return token, jti
+
+
+def decode_token(token: str) -> dict:
+    return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM], issuer=settings.app_name)
+
+
+async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> CurrentUser:
+    try:
+        payload = decode_token(token)
+    except ExpiredSignatureError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired") from exc
+    except PyJWTError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from exc
+
+    if payload.get("type") != "access":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token type")
+
+    username = payload.get("sub")
+    if not username:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
+
+    user = await get_user(username)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    if not user.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive user")
+    return user
+
+
+async def get_current_user_without_confirmation(token: Annotated[str, Depends(oauth2_scheme)]) -> CurrentUser:
+    try:
+        payload = decode_token(token)
+    except ExpiredSignatureError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired") from exc
+    except PyJWTError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from exc
+
+    username = payload.get("sub")
+    if not username:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
+    user = await get_user(username)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    return user
+
+
+async def revoke_refresh_token(jti: str) -> None:
+    await refresh_tokens_collection.update_one({"jti": jti}, {"$set": {"revoked": True, "revoked_at": _utcnow()}})
+
+
+async def validate_refresh_token(token: str) -> CurrentUser:
+    try:
+        payload = decode_token(token)
+    except ExpiredSignatureError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token expired") from exc
+    except PyJWTError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token") from exc
+
+    if payload.get("type") != "refresh":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token type")
+
+    jti = payload.get("jti")
+    username = payload.get("sub")
+    token_doc = await refresh_tokens_collection.find_one({"jti": jti, "username": username, "revoked": False})
+    if not token_doc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token revoked")
+
+    user = await get_user(username)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    return user
+
+
+async def get_user_id(username: str) -> str:
+    user = await users_collection.find_one({"username": username}, {"_id": 1})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return str(user["_id"])
+
+
+async def get_username(user_id: str) -> str:
+    user = await users_collection.find_one({"_id": ObjectId(user_id)}, {"username": 1})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user["username"]
+
+
+async def get_post_owner_id(post_id: str) -> str:
+    post = await post_collection.find_one({"_id": ObjectId(post_id)}, {"user_id": 1})
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    return str(post["user_id"])
+
+
+async def check_post_exists(post_id: str, db=None):
+    post = await post_collection.find_one({"_id": ObjectId(post_id)}, {"_id": 1})
+    if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
- 
-def guardar_log(evento):
-    now = datetime.now()
-    logging.info(f'{now} - {evento}')
 
-def create_access_token(data: dict, expires_delta: timedelta = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=15)  # Duración por defecto de 15 minutos
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+def generate_numeric_code(length: int = 6) -> str:
+    max_number = 10 ** length
+    return str(secrets.randbelow(max_number)).zfill(length)

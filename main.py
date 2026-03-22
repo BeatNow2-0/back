@@ -1,68 +1,82 @@
-import asyncio
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import start_http_server
 from pymongo.errors import PyMongoError
+
 from config.changeStream import watch_changes
-from routes.users_routes import router as users_router
-from routes.posts_routes import router as posts_router
-from routes.interactions_routes import router as interactions_router
+from config.db import ensure_indexes, handle_database_error
+from config.settings import settings
+from core.exceptions import unhandled_exception_handler
+from core.logging import configure_logging
+from core.security_headers import SecurityHeadersMiddleware
+from routes.download_routes import router as download_router
+from routes.filter_routes import router as filter_router
 from routes.follow_routes import router as follow_router
+from routes.interactions_routes import router as interactions_router
 from routes.lyrics_routes import router as lyrics_routes
+from routes.mail_routes import router as mail_router
+from routes.posts_routes import router as posts_router
 from routes.routes import router as routes_router
 from routes.search_routes import router as search_router
-from routes.filter_routes import router as filter_router
-from routes.mail_routes import router as mail_router
-from routes.download_routes import router as donwload_router
-from prometheus_client import start_http_server
-import uvicorn
-from config.db import handle_database_error
-from fastapi.middleware.cors import CORSMiddleware
+from routes.users_routes import router as users_router
 
-# Iniciar la aplicación
-app = FastAPI()
+configure_logging()
 
-origins = [
-    "https://app.beatnow.app",  # frontend producción
-    "http://localhost:3000",              # si tu front en dev corre aquí
-    "http://127.0.0.1:3000",
-    "http://localhost:5173",              # ajusta según tu entorno
-]
 
-# Configurar CORS
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await ensure_indexes()
+    if settings.prometheus_enabled:
+        start_http_server(settings.prometheus_port)
+    app.state.change_stream_task = None
+    if settings.environment != "test":
+        try:
+            import asyncio
+
+            app.state.change_stream_task = asyncio.create_task(watch_changes())
+        except Exception:
+            app.state.change_stream_task = None
+    yield
+    task = getattr(app.state, "change_stream_task", None)
+    if task:
+        task.cancel()
+
+
+app = FastAPI(title=settings.app_name, debug=settings.debug, lifespan=lifespan)
+app.add_exception_handler(PyMongoError, handle_database_error)
+app.add_exception_handler(Exception, unhandled_exception_handler)
+app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,      # lista explícita porque allow_credentials=True
-    allow_credentials=True,     # si necesitas cookies / Authorization
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["set-cookie"],  # opcional
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+    expose_headers=["X-Request-ID"],
     max_age=600,
 )
 
-# Incluir los routers
-app.include_router(users_router, prefix="/v1/api/users")
-app.include_router(posts_router, prefix="/v1/api/posts")
-app.include_router(interactions_router, prefix="/v1/api/interactions")
-app.include_router(lyrics_routes, prefix="/v1/api/lyrics")
-app.include_router(follow_router, prefix="/v1/api/follows")
-app.include_router(search_router, prefix="/v1/api/search")
-app.include_router(filter_router, prefix="/v1/api/filter")
-app.include_router(mail_router, prefix="/v1/api/mail")
-app.include_router(donwload_router, prefix="/v1/api/download")
+app.include_router(users_router, prefix="/v1/api/users", tags=["users"])
+app.include_router(posts_router, prefix="/v1/api/posts", tags=["posts"])
+app.include_router(interactions_router, prefix="/v1/api/interactions", tags=["interactions"])
+app.include_router(lyrics_routes, prefix="/v1/api/lyrics", tags=["lyrics"])
+app.include_router(follow_router, prefix="/v1/api/follows", tags=["follows"])
+app.include_router(search_router, prefix="/v1/api/search", tags=["search"])
+app.include_router(filter_router, prefix="/v1/api/filter", tags=["filter"])
+app.include_router(mail_router, prefix="/v1/api/mail", tags=["mail"])
+app.include_router(download_router, prefix="/v1/api/download", tags=["download"])
 app.include_router(routes_router)
-# Manejador de excepciones global para errores de base de datos
-app.add_exception_handler(PyMongoError, handle_database_error)
 
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(watch_changes())
+@app.get("/healthz", tags=["health"])
+async def healthz():
+    return {"status": "ok", "environment": settings.environment}
 
-def main():
-    # Iniciar el servidor de Prometheus
-    start_http_server(8000)
-    # Iniciar el servidor de FastAPI
-    uvicorn.run(app, host="localhost", port=8001)
 
-if __name__ == "__main__":
-    # Iniciar la aplicación
-    main()
+@app.get("/readyz", tags=["health"])
+async def readyz():
+    return {"status": "ready"}
