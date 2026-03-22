@@ -22,12 +22,23 @@ except RuntimeError as exc:
     logger.error("MongoDB configuration error: %s", exc)
     _mongo_uri = f"mongodb://localhost:27017/{settings.mongo_db}"
 
-mongo_client = AsyncIOMotorClient(
-    _mongo_uri,
-    serverSelectionTimeoutMS=5000,
-    connectTimeoutMS=5000,
-    socketTimeoutMS=5000,
-)
+try:
+    mongo_client = AsyncIOMotorClient(
+        _mongo_uri,
+        serverSelectionTimeoutMS=5000,
+        connectTimeoutMS=5000,
+        socketTimeoutMS=5000,
+    )
+except Exception as exc:
+    DATABASE_CONFIGURATION_ERROR = str(exc)
+    logger.error("MongoDB client initialization failed: %s", exc)
+    mongo_client = AsyncIOMotorClient(
+        f"mongodb://localhost:27017/{settings.mongo_db}",
+        serverSelectionTimeoutMS=5000,
+        connectTimeoutMS=5000,
+        socketTimeoutMS=5000,
+    )
+
 db = mongo_client[settings.mongo_db]
 
 users_collection = db["Users"]
