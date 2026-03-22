@@ -21,7 +21,12 @@ if Path(DEFAULT_ENV_FILE).exists():
 def _split_csv(value: str | None) -> List[str]:
     if not value:
         return []
-    return [item.strip() for item in value.split(",") if item.strip()]
+    normalized: List[str] = []
+    for item in value.split(","):
+        item = item.strip().rstrip("/")
+        if item and item not in normalized:
+            normalized.append(item)
+    return normalized
 
 
 @dataclass(slots=True)
@@ -64,7 +69,12 @@ class Settings:
     prometheus_port: int = int(os.getenv("PROMETHEUS_PORT", "9000"))
 
     def __post_init__(self) -> None:
-        self.cors_origins = _split_csv(os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173"))
+        self.cors_origins = _split_csv(
+            os.getenv(
+                "CORS_ORIGINS",
+                "https://app.beatnow.app,http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173",
+            )
+        )
         self.media_root.mkdir(parents=True, exist_ok=True)
         if self.environment == "production":
             if not self.secret_key or self.secret_key == "tu_super_secreto":
