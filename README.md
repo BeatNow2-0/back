@@ -14,6 +14,28 @@ uvicorn main:app --reload
 
 ## Production deployment (Ubuntu VPS)
 
+## MongoDB configuration
+
+You can configure MongoDB in **either** of these ways:
+
+### Option A: full URI
+
+```env
+MONGO_URI=mongodb+srv://user:password@cluster0.example.mongodb.net/BeatNow?retryWrites=true&w=majority
+MONGO_DB=BeatNow
+```
+
+### Option B: separate variables
+
+```env
+MONGO_USER=your_mongo_user
+MONGO_PASSWORD=your_mongo_password
+MONGO_HOST=cluster0.example.mongodb.net
+MONGO_DB=BeatNow
+```
+
+`MONGO_URI` takes precedence if it is set.
+
 Run behind **Nginx** and **Gunicorn/Uvicorn workers**.
 
 ```bash
