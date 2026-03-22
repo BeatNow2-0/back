@@ -13,9 +13,17 @@ from pymongo.errors import PyMongoError
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+DATABASE_CONFIGURATION_ERROR: str | None = None
+
+try:
+    _mongo_uri = settings.resolved_mongo_uri
+except RuntimeError as exc:
+    DATABASE_CONFIGURATION_ERROR = str(exc)
+    logger.error("MongoDB configuration error: %s", exc)
+    _mongo_uri = f"mongodb://localhost:27017/{settings.mongo_db}"
 
 mongo_client = AsyncIOMotorClient(
-    settings.resolved_mongo_uri,
+    _mongo_uri,
     serverSelectionTimeoutMS=5000,
     connectTimeoutMS=5000,
     socketTimeoutMS=5000,
@@ -45,6 +53,9 @@ async def handle_database_error(request: Request, exc: PyMongoError):
 
 
 async def ping_database() -> bool:
+    if DATABASE_CONFIGURATION_ERROR:
+        logger.warning("Skipping MongoDB ping because configuration is invalid: %s", DATABASE_CONFIGURATION_ERROR)
+        return False
     try:
         await asyncio.wait_for(mongo_client.admin.command("ping"), timeout=5)
         return True

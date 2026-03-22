@@ -87,9 +87,9 @@ class Settings:
         if self.mongo_uri:
             return self.mongo_uri
         if not all([self.mongo_user, self.mongo_password, self.mongo_host, self.mongo_db]):
-            if self.environment != "production":
+            if self.environment == "test":
                 return f"mongodb://localhost:27017/{self.mongo_db}"
-            raise RuntimeError("MongoDB settings are incomplete")
+            raise RuntimeError("MongoDB settings are incomplete: configure MONGO_URI or Mongo credentials")
         return (
             f"mongodb+srv://{self.mongo_user}:{self.mongo_password}"
             f"@{self.mongo_host}/{self.mongo_db}?retryWrites=true&w=majority"

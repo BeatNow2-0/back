@@ -8,7 +8,7 @@ from prometheus_client import start_http_server
 from pymongo.errors import PyMongoError
 
 from config.changeStream import watch_changes
-from config.db import ensure_indexes, handle_database_error
+from config.db import DATABASE_CONFIGURATION_ERROR, ensure_indexes, handle_database_error
 from config.settings import settings
 from core.exceptions import unhandled_exception_handler
 from core.logging import configure_logging
@@ -29,7 +29,10 @@ configure_logging()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    app.state.database_error = DATABASE_CONFIGURATION_ERROR
     app.state.database_ready = await ensure_indexes()
+    if not app.state.database_ready and app.state.database_error is None:
+        app.state.database_error = "MongoDB unavailable during startup"
     if settings.prometheus_enabled:
         start_http_server(settings.prometheus_port)
     app.state.change_stream_task = None
@@ -82,4 +85,5 @@ async def readyz():
     return {
         "status": "ready" if getattr(app.state, "database_ready", False) else "degraded",
         "database_ready": getattr(app.state, "database_ready", False),
+        "database_error": getattr(app.state, "database_error", None),
     }
