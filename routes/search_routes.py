@@ -4,8 +4,13 @@ from model.user_shemas import NewUser, UserInDB, UserSearch
 from config.security import  get_current_user, get_user_id
 from config.db import users_collection, db, post_collection
 from fastapi import Form, HTTPException, Depends, APIRouter
-from Levenshtein import distance as levenshtein_distance
 import difflib
+
+try:
+    from Levenshtein import distance as levenshtein_distance
+except ModuleNotFoundError:
+    def levenshtein_distance(a: str, b: str) -> int:
+        return int((1 - difflib.SequenceMatcher(None, a, b).ratio()) * max(len(a), len(b), 1))
 
 # Iniciar router
 router = APIRouter()
