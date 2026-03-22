@@ -29,11 +29,11 @@ configure_logging()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await ensure_indexes()
+    app.state.database_ready = await ensure_indexes()
     if settings.prometheus_enabled:
         start_http_server(settings.prometheus_port)
     app.state.change_stream_task = None
-    if settings.environment != "test":
+    if app.state.database_ready and settings.environment != "test":
         try:
             import asyncio
 
@@ -79,4 +79,7 @@ async def healthz():
 
 @app.get("/readyz", tags=["health"])
 async def readyz():
-    return {"status": "ready"}
+    return {
+        "status": "ready" if getattr(app.state, "database_ready", False) else "degraded",
+        "database_ready": getattr(app.state, "database_ready", False),
+    }
