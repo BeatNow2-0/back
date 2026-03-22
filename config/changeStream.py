@@ -1,55 +1,36 @@
+from __future__ import annotations
+
+import asyncio
+import logging
 
 from bson import ObjectId
+
 from config.db import interactions_collection, post_collection
 from routes.interactions_routes import count_likes, count_saved
-# Change Stream to watch the interactions_collection
+
+logger = logging.getLogger(__name__)
+
+
 async def watch_changes():
-    async with interactions_collection.watch() as stream:
-        async for change in stream:
-            if change["operationType"] == "insert":
-                document = change["fullDocument"]
-                post_id = document["post_id"]
-                
-                if "like_date" in document:
-                    count= await count_likes(post_id)
-                    await post_collection.update_one(
-                        {"_id": ObjectId(post_id)},
-                        {"$set": {"likes": count}}
-                    )
-                if "saved_date" in document:
-                    count= await count_saved(post_id)
-                    await post_collection.update_one(
-                        {"_id": ObjectId(post_id)},
-                        {"$set": {"saves": count}}
-                    )
-            elif change["operationType"] == "update":
-                document_key = change["documentKey"]
-                update_description = change["updateDescription"]
-                interaction_id = document_key["_id"]
-
-                # Recuperar el documento completo para obtener post_id
-                interaction = await interactions_collection.find_one({"_id": interaction_id})
-                post_id = interaction["post_id"]
-
-                if "like_date" in update_description.get("updatedFields", {}):
-                    count= await count_likes(post_id)
-                    await post_collection.update_one(
-                        {"_id": ObjectId(post_id)},
-                        {"$set": {"likes": count}}
-                    )
-                if "like_date" in update_description.get("removedFields", []):
-                    count= await count_likes(post_id)
-                    await post_collection.update_one(
-                        {"_id": ObjectId(post_id)},
-                        {"$set": {"likes": count}}
-                    )
-                if "saved_date" in update_description.get("updatedFields", {}):
-                    await post_collection.update_one(
-                        {"_id": ObjectId(post_id)},
-                        {"$set": {"saves": count}}
-                    )
-                if "saved_date" in update_description.get("removedFields", []):
-                    await post_collection.update_one(
-                        {"_id": ObjectId(post_id)},
-                        {"$set": {"saves": count}}
-                    )
+    while True:
+        try:
+            async with interactions_collection.watch() as stream:
+                async for change in stream:
+                    if change["operationType"] not in {"insert", "update", "replace", "delete"}:
+                        continue
+                    post_id = None
+                    if change.get("fullDocument"):
+                        post_id = change["fullDocument"].get("post_id")
+                    elif change.get("documentKey"):
+                        interaction = await interactions_collection.find_one({"_id": change["documentKey"]["_id"]})
+                        post_id = interaction.get("post_id") if interaction else None
+                    if not post_id:
+                        continue
+                    likes = await count_likes(post_id)
+                    saves = await count_saved(post_id)
+                    await post_collection.update_one({"_id": ObjectId(post_id)}, {"$set": {"likes": likes, "saves": saves}})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Change stream watcher failed: %s", exc)
+            await asyncio.sleep(5)

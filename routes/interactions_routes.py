@@ -360,3 +360,15 @@ async def count_views(post_id: str, db=Depends(get_database)):
     except Exception as e:
         print(f"Error al contar las views: {e}")
         return 0
+
+
+async def has_liked_post(post_id: str, current_user: NewUser) -> bool:
+    user_id = await get_user_id(current_user.username)
+    interaction = await interactions_collection.find_one({"user_id": user_id, "post_id": _normalize_post_id(post_id), "like_date": {"$exists": True}})
+    return interaction is not None
+
+
+async def has_saved_post(post_id: str, current_user: NewUser) -> bool:
+    user_id = await get_user_id(current_user.username)
+    interaction = await interactions_collection.find_one({"user_id": user_id, "post_id": _normalize_post_id(post_id), "saved_date": {"$exists": True}})
+    return interaction is not None
