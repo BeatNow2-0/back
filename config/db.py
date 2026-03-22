@@ -1,55 +1,91 @@
+from __future__ import annotations
+
+import asyncio
 import logging
-import os
 from typing import List, Optional
+
+from fastapi import Request
 from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.database import Database
 from pymongo.errors import PyMongoError
-from fastapi import HTTPException, Request
-from dotenv import load_dotenv
 
-# Cargar variables del .env
-load_dotenv()
+from config.settings import settings
 
-# Leer las variables
-MONGO_USER = os.getenv("MONGO_USER")
-MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
-MONGO_HOST = os.getenv("MONGO_HOST")
-MONGO_DB = os.getenv("MONGO_DB")
+logger = logging.getLogger(__name__)
+DATABASE_CONFIGURATION_ERROR: str | None = None
 
-# Construir la URI sin exponer la contraseña en el código
-MONGODB_URI = (
-    f"mongodb+srv://{MONGO_USER}:{MONGO_PASSWORD}"
-    f"@{MONGO_HOST}/{MONGO_DB}?retryWrites=true&w=majority"
+try:
+    _mongo_uri = settings.resolved_mongo_uri
+except RuntimeError as exc:
+    DATABASE_CONFIGURATION_ERROR = str(exc)
+    logger.error("MongoDB configuration error: %s", exc)
+    _mongo_uri = f"mongodb://localhost:27017/{settings.mongo_db}"
+
+mongo_client = AsyncIOMotorClient(
+    _mongo_uri,
+    serverSelectionTimeoutMS=5000,
+    connectTimeoutMS=5000,
+    socketTimeoutMS=5000,
 )
+db = mongo_client[settings.mongo_db]
 
-# Crear cliente de MongoDB
-mongo_client = AsyncIOMotorClient(MONGODB_URI)
-db = mongo_client[MONGO_DB]
-
-# Colecciones
-users_collection = db['Users']
-post_collection = db['Posts']
-interactions_collection = db['Interactions']
-lyrics_collection = db['Lyrics']
-follows_collection = db['Follows']
-genres_collection = db['Genres']
-moods_collection = db['Moods']
-instruments_collection = db['Instruments']
-mail_code_collection = db['MailCode']
-password_reset_collection = db['PasswordReset']
+users_collection = db["Users"]
+post_collection = db["Posts"]
+interactions_collection = db["Interactions"]
+lyrics_collection = db["Lyrics"]
+follows_collection = db["Follows"]
+genres_collection = db["Genres"]
+moods_collection = db["Moods"]
+instruments_collection = db["Instruments"]
+mail_code_collection = db["MailCode"]
+password_reset_collection = db["PasswordReset"]
+refresh_tokens_collection = db["RefreshTokens"]
 
 
 async def get_database() -> Database:
     return db
 
-# Manejador de errores
+
 async def handle_database_error(request: Request, exc: PyMongoError):
-    logging.exception("Database error: %s", exc)
+    logger.exception("Database error on %s", request.url.path)
     return JSONResponse(status_code=500, content={"detail": "Database error"})
+
+
+async def ping_database() -> bool:
+    if DATABASE_CONFIGURATION_ERROR:
+        logger.warning("Skipping MongoDB ping because configuration is invalid: %s", DATABASE_CONFIGURATION_ERROR)
+        return False
+    try:
+        await asyncio.wait_for(mongo_client.admin.command("ping"), timeout=5)
+        return True
+    except Exception as exc:
+        logger.warning("MongoDB ping failed during startup: %s", exc)
+        return False
+
+
+async def ensure_indexes() -> bool:
+    if not await ping_database():
+        return False
+    try:
+        await asyncio.wait_for(users_collection.create_index("username", unique=True), timeout=5)
+        await asyncio.wait_for(users_collection.create_index("email", unique=True), timeout=5)
+        await asyncio.wait_for(post_collection.create_index("user_id"), timeout=5)
+        await asyncio.wait_for(interactions_collection.create_index([("user_id", 1), ("post_id", 1)], unique=True), timeout=5)
+        await asyncio.wait_for(follows_collection.create_index([("user_id_following", 1), ("user_id_followed", 1)], unique=True), timeout=5)
+        await asyncio.wait_for(lyrics_collection.create_index("user_id"), timeout=5)
+        await asyncio.wait_for(mail_code_collection.create_index("user_id", unique=True), timeout=5)
+        await asyncio.wait_for(password_reset_collection.create_index("token_hash", unique=True), timeout=5)
+        await asyncio.wait_for(password_reset_collection.create_index("expires_at", expireAfterSeconds=0), timeout=5)
+        await asyncio.wait_for(refresh_tokens_collection.create_index("jti", unique=True), timeout=5)
+        await asyncio.wait_for(refresh_tokens_collection.create_index("expires_at", expireAfterSeconds=0), timeout=5)
+        return True
+    except Exception as exc:
+        logger.warning("MongoDB index bootstrap failed: %s", exc)
+        return False
 
 
 def parse_list(value: Optional[str]) -> Optional[List[str]]:
     if value:
-        return value.split(',')
+        return [item.strip() for item in value.split(",") if item.strip()]
     return None
