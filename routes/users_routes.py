@@ -35,7 +35,7 @@ from config.security import (
 from config.settings import settings
 from core.rate_limit import enforce_rate_limit
 from model.lyrics_shemas import LyricsInDB
-from model.user_shemas import CurrentUser, LoginResponse, NewUser, RefreshTokenRequest, UserPublic
+from model.user_shemas import CurrentUser, LoginResponse, NewUser, RefreshTokenRequest, UserPublic, UserUpdate
 from services.storage import create_user_directories, delete_user_directories
 
 router = APIRouter()
@@ -80,6 +80,45 @@ async def delete_user(current_user: CurrentUser = Depends(get_current_user)):
 @router.get("/users/me", response_model=UserPublic)
 async def read_users_me(current_user: Annotated[CurrentUser, Depends(get_current_user_without_confirmation)]):
     return UserPublic(**current_user.model_dump(by_alias=True))
+
+
+@router.put("/users/me", response_model=UserPublic)
+async def update_users_me(
+    payload: UserUpdate,
+    current_user: Annotated[CurrentUser, Depends(get_current_user_without_confirmation)],
+):
+    update_data = payload.model_dump(exclude_unset=True)
+    if not update_data:
+        return UserPublic(**current_user.model_dump(by_alias=True))
+
+    normalized_username = update_data.get("username")
+    if normalized_username is not None:
+        normalized_username = normalized_username.strip()
+        if not normalized_username:
+            raise HTTPException(status_code=400, detail="Username cannot be empty")
+        update_data["username"] = normalized_username
+        if normalized_username != current_user.username:
+            existing_user = await users_collection.find_one({"username": normalized_username})
+            if existing_user and str(existing_user.get("_id")) != current_user.id:
+                raise HTTPException(status_code=400, detail="Username already registered")
+
+    normalized_full_name = update_data.get("full_name")
+    if normalized_full_name is not None:
+        normalized_full_name = normalized_full_name.strip()
+        update_data["full_name"] = normalized_full_name or None
+
+    normalized_bio = update_data.get("bio")
+    if normalized_bio is not None:
+        normalized_bio = normalized_bio.strip()
+        update_data["bio"] = normalized_bio or None
+
+    if update_data:
+        await users_collection.update_one({"_id": ObjectId(current_user.id)}, {"$set": update_data})
+
+    updated_user = await users_collection.find_one({"_id": ObjectId(current_user.id)})
+    if not updated_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return UserPublic(**updated_user)
 
 
 @router.post("/login", response_model=LoginResponse)

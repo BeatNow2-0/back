@@ -59,6 +59,12 @@ class UserInfo(UserPublic):
     following: Optional[list[str]] = None
 
 
+class UserUpdate(BaseModel):
+    full_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    username: Optional[str] = Field(default=None, min_length=3, max_length=32, pattern=r"^[a-zA-Z0-9_.-]+$")
+    bio: Optional[str] = Field(default=None, max_length=280)
+
+
 class UserSearch(BaseModel):
     username: str = Field(min_length=1, max_length=64)
 
