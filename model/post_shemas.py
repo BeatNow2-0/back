@@ -25,6 +25,8 @@ class Post(NewPost):
     likes: int = 0
     saves: int = 0
     views: int = 0
+    audio_url: Optional[str] = None
+    cover_image_url: Optional[str] = None
 
 
 class PostInDB(Post):

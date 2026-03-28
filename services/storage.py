@@ -7,14 +7,35 @@ from fastapi import HTTPException, UploadFile, status
 
 from config.settings import settings
 
-ALLOWED_IMAGE_CONTENT_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif"}
-ALLOWED_AUDIO_CONTENT_TYPES = {"audio/mpeg": ".mp3", "audio/wav": ".wav", "audio/x-wav": ".wav"}
+ALLOWED_IMAGE_CONTENT_TYPES = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
+ALLOWED_AUDIO_CONTENT_TYPES = {
+    "audio/mpeg": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+}
 MAX_IMAGE_SIZE = 5 * 1024 * 1024
 MAX_AUDIO_SIZE = 20 * 1024 * 1024
 
 
 def _safe_user_path(user_id: str) -> Path:
     return settings.media_root / user_id
+
+
+def _replace_file(target: Path, source: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+
+
+def _remove_matching_files(directory: Path, pattern: str) -> None:
+    for existing in directory.glob(pattern):
+        existing.unlink(missing_ok=True)
 
 
 def create_user_directories(user_id: str) -> Path:
@@ -52,10 +73,12 @@ async def save_post_files(user_id: str, post_id: str, cover_file: UploadFile, au
     post_dir.mkdir(parents=True, exist_ok=True)
 
     cover_path = post_dir / f"cover{image_suffix}"
+    legacy_cover_path = post_dir / f"caratula{image_suffix}"
     audio_path = post_dir / f"audio{audio_suffix}"
 
     with cover_path.open("wb") as image_buffer:
         shutil.copyfileobj(cover_file.file, image_buffer)
+    _replace_file(legacy_cover_path, cover_path)
     with audio_path.open("wb") as audio_buffer:
         shutil.copyfileobj(audio_file.file, audio_buffer)
 
@@ -69,16 +92,17 @@ async def update_post_files(user_id: str, post_id: str, cover_file: UploadFile |
 
     if cover_file is not None:
         image_suffix = await _validate_upload(cover_file, ALLOWED_IMAGE_CONTENT_TYPES, MAX_IMAGE_SIZE, "image")
-        for existing in post_dir.glob("cover.*"):
-            existing.unlink(missing_ok=True)
-        with (post_dir / f"cover{image_suffix}").open("wb") as buffer:
+        _remove_matching_files(post_dir, "cover.*")
+        _remove_matching_files(post_dir, "caratula.*")
+        cover_path = post_dir / f"cover{image_suffix}"
+        with cover_path.open("wb") as buffer:
             shutil.copyfileobj(cover_file.file, buffer)
+        _replace_file(post_dir / f"caratula{image_suffix}", cover_path)
         updated["cover_format"] = image_suffix.lstrip(".")
 
     if audio_file is not None:
         audio_suffix = await _validate_upload(audio_file, ALLOWED_AUDIO_CONTENT_TYPES, MAX_AUDIO_SIZE, "audio")
-        for existing in post_dir.glob("audio.*"):
-            existing.unlink(missing_ok=True)
+        _remove_matching_files(post_dir, "audio.*")
         with (post_dir / f"audio{audio_suffix}").open("wb") as buffer:
             shutil.copyfileobj(audio_file.file, buffer)
         updated["audio_format"] = audio_suffix.lstrip(".")
@@ -90,3 +114,25 @@ def delete_post_directory(user_id: str, post_id: str) -> None:
     post_dir = _safe_user_path(user_id) / "posts" / post_id
     if post_dir.exists():
         shutil.rmtree(post_dir)
+
+
+async def save_profile_photo(user_id: str, upload: UploadFile) -> str:
+    image_suffix = await _validate_upload(upload, ALLOWED_IMAGE_CONTENT_TYPES, MAX_IMAGE_SIZE, "image")
+    profile_dir = _safe_user_path(user_id) / "photo_profile"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    _remove_matching_files(profile_dir, "photo_profile.*")
+
+    profile_path = profile_dir / f"photo_profile{image_suffix}"
+    with profile_path.open("wb") as buffer:
+        shutil.copyfileobj(upload.file, buffer)
+
+    return image_suffix.lstrip(".")
+
+
+def reset_profile_photo(user_id: str) -> None:
+    profile_dir = _safe_user_path(user_id) / "photo_profile"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    _remove_matching_files(profile_dir, "photo_profile.*")
+    if settings.default_profile_image.exists():
+        target = profile_dir / f"photo_profile{settings.default_profile_image.suffix.lower()}"
+        shutil.copy2(settings.default_profile_image, target)

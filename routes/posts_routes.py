@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 from datetime import datetime, timezone
 from typing import Optional
@@ -8,13 +9,49 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from config.db import get_database, interactions_collection, lyrics_collection, post_collection
-from config.security import get_current_user, get_user_id, get_username
+from config.security import get_current_user, get_user, get_user_id, get_username
+from config.settings import settings
 from model.post_shemas import NewPost, Post, PostInDB, PostShowed
 from model.user_shemas import CurrentUser
 from routes.interactions_routes import count_likes, count_saved, has_liked_post, has_saved_post
 from services.storage import delete_post_directory, save_post_files, update_post_files
 
 router = APIRouter()
+
+
+def _parse_optional_list(raw_value: Optional[str]) -> Optional[list[str]]:
+    if raw_value is None:
+        return None
+
+    value = raw_value.strip()
+    if not value:
+        return None
+
+    if value.startswith("["):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                normalized = [str(item).strip() for item in parsed if str(item).strip()]
+                return normalized or None
+        except json.JSONDecodeError:
+            pass
+
+    normalized = [item.strip().strip('"').strip("'") for item in value.split(",") if item.strip()]
+    return normalized or None
+
+
+def _with_media_urls(post: dict) -> dict:
+    payload = dict(post)
+    user_id = str(payload.get("user_id", ""))
+    post_id = str(payload.get("_id", ""))
+    base_url = settings.media_base_url.rstrip("/")
+    cover_format = payload.get("cover_format")
+    audio_format = payload.get("audio_format")
+    if user_id and post_id and cover_format:
+        payload["cover_image_url"] = f"{base_url}/{user_id}/posts/{post_id}/caratula.{cover_format}"
+    if user_id and post_id and audio_format:
+        payload["audio_url"] = f"{base_url}/{user_id}/posts/{post_id}/audio.{audio_format}"
+    return payload
 
 
 @router.post("/upload", response_model=PostInDB)
@@ -33,10 +70,10 @@ async def upload_post(
     new_post = NewPost(
         title=title,
         description=description,
-        tags=[item.strip() for item in tags.split(",")] if tags else None,
+        tags=_parse_optional_list(tags),
         genre=genre,
-        moods=[item.strip() for item in moods.split(",")] if moods else None,
-        instruments=[item.strip() for item in instruments.split(",")] if instruments else None,
+        moods=_parse_optional_list(moods),
+        instruments=_parse_optional_list(instruments),
         bpm=bpm,
     )
 
@@ -67,7 +104,7 @@ async def upload_post(
         raise
 
     existing_post = await post_collection.find_one({"_id": result.inserted_id})
-    return PostInDB(**existing_post)
+    return PostInDB(**_with_media_urls(existing_post))
 
 
 @router.put("/update/{post_id}", response_model=PostInDB)
@@ -98,9 +135,9 @@ async def update_post(
             "title": title,
             "description": description,
             "genre": genre,
-            "tags": [item.strip() for item in tags.split(",")] if tags else None,
-            "moods": [item.strip() for item in moods.split(",")] if moods else None,
-            "instruments": [item.strip() for item in instruments.split(",")] if instruments else None,
+            "tags": _parse_optional_list(tags),
+            "moods": _parse_optional_list(moods),
+            "instruments": _parse_optional_list(instruments),
             "bpm": bpm,
         }.items()
         if value is not None
@@ -113,7 +150,20 @@ async def update_post(
         await post_collection.update_one({"_id": ObjectId(post_id)}, {"$set": update_data})
 
     updated_post = await post_collection.find_one({"_id": ObjectId(post_id)})
-    return PostInDB(**updated_post)
+    return PostInDB(**_with_media_urls(updated_post))
+
+
+@router.get("/user/{username}", response_model=list[PostInDB])
+async def get_posts_for_user(
+    username: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    user = await get_user(username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    posts = await post_collection.find({"user_id": user.id}).sort("publication_date", -1).to_list(None)
+    return [PostInDB(**_with_media_urls(post)) for post in posts]
 
 
 @router.get("/random", response_model=PostShowed)
@@ -138,7 +188,7 @@ async def read_post(post_id: str, current_user: CurrentUser):
         return None
     creator_name = await get_username(post_dict["user_id"])
     return PostShowed(
-        **post_dict,
+        **_with_media_urls(post_dict),
         creator_username=creator_name,
         isLiked=await has_liked_post(post_id, current_user),
         isSaved=await has_saved_post(post_id, current_user),

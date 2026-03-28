@@ -47,13 +47,9 @@ async def create_and_save_confirmation_code(user: CurrentUser) -> str:
     return confirmation_code
 
 
-@router.post("/send-confirmation", status_code=status.HTTP_204_NO_CONTENT)
-async def send_confirmation(request: Request, user: CurrentUser = Depends(get_current_user_without_confirmation)):
-    await enforce_rate_limit(request, f"confirm:{user.username}", settings.confirmation_rate_limit)
-    if user.is_active:
-        raise HTTPException(status_code=400, detail="User already confirmed")
+async def send_confirmation_email_to_user(user: CurrentUser) -> None:
     confirmation_code = await create_and_save_confirmation_code(user)
-    subject = "Confirmación de Registro"
+    subject = "Confirmacion de Registro"
     html_content = f"""
     <html><body>
         <h1>Verify your email address</h1>
@@ -64,6 +60,14 @@ async def send_confirmation(request: Request, user: CurrentUser = Depends(get_cu
     </body></html>
     """
     await send_email(user.email, subject, html_content)
+
+
+@router.post("/send-confirmation", status_code=status.HTTP_204_NO_CONTENT)
+async def send_confirmation(request: Request, user: CurrentUser = Depends(get_current_user_without_confirmation)):
+    await enforce_rate_limit(request, f"confirm:{user.username}", settings.confirmation_rate_limit)
+    if user.is_active:
+        raise HTTPException(status_code=400, detail="User already confirmed")
+    await send_confirmation_email_to_user(user)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

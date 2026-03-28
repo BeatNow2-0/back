@@ -18,8 +18,6 @@ async def token_login(request: Request, form_data: OAuth2PasswordRequestForm = D
     user_dict = await users_collection.find_one({"username": form_data.username})
     if not user_dict or not verify_password(form_data.password, user_dict.get("password", "")):
         raise HTTPException(status_code=400, detail="Incorrect username or password")
-    if not user_dict.get("is_active"):
-        raise HTTPException(status_code=403, detail="Account not confirmed")
 
     access_token = create_access_token(user_dict["username"])
     refresh_token, _ = await create_refresh_token(user_dict["username"])

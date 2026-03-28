@@ -20,6 +20,7 @@ class User(BaseModel):
     email: str = Field(min_length=5, max_length=254)
     is_active: bool
     bio: Optional[str] = Field(default=None, max_length=280)
+    profile_image_url: Optional[str] = None
 
 
 class CurrentUser(User):

@@ -6,7 +6,7 @@ import jwt
 from typing import Annotated, List
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile, status
 from fastapi.security import OAuth2PasswordRequestForm
 
 from config.db import (
@@ -35,11 +35,37 @@ from config.security import (
 from config.settings import settings
 from core.rate_limit import enforce_rate_limit
 from model.lyrics_shemas import LyricsInDB
-from model.user_shemas import CurrentUser, LoginResponse, NewUser, RefreshTokenRequest, UserPublic, UserUpdate
-from services.storage import create_user_directories, delete_user_directories
+from model.post_shemas import PostInDB
+from model.user_shemas import CurrentUser, LoginResponse, NewUser, RefreshTokenRequest, UserProfile, UserPublic, UserUpdate
+from routes.mail_routes import send_confirmation_email_to_user
+from services.storage import create_user_directories, delete_user_directories, reset_profile_photo, save_profile_photo
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _profile_image_url(user_id: str) -> str:
+    return f"{settings.media_base_url.rstrip('/')}/{user_id}/photo_profile/photo_profile.png"
+
+
+def _user_public_payload(user: dict) -> dict:
+    payload = dict(user)
+    payload["profile_image_url"] = _profile_image_url(str(user["_id"]))
+    return payload
+
+
+def _post_payload(post: dict) -> dict:
+    payload = dict(post)
+    post_id = str(payload.get("_id", ""))
+    user_id = str(payload.get("user_id", ""))
+    cover_format = payload.get("cover_format")
+    audio_format = payload.get("audio_format")
+    base_url = settings.media_base_url.rstrip("/")
+    if post_id and user_id and cover_format:
+        payload["cover_image_url"] = f"{base_url}/{user_id}/posts/{post_id}/caratula.{cover_format}"
+    if post_id and user_id and audio_format:
+        payload["audio_url"] = f"{base_url}/{user_id}/posts/{post_id}/audio.{audio_format}"
+    return payload
 
 
 @router.post("/register", response_model=UserPublic, status_code=status.HTTP_201_CREATED)
@@ -55,7 +81,13 @@ async def register(user: NewUser):
     user_id = str(result.inserted_id)
     create_user_directories(user_id)
     created = await users_collection.find_one({"_id": result.inserted_id})
-    return UserPublic(**created)
+    current_user = CurrentUser(**created)
+    if not current_user.is_active:
+        try:
+            await send_confirmation_email_to_user(current_user)
+        except Exception:
+            logger.exception("Failed to send confirmation email for user %s", current_user.username)
+    return UserPublic(**_user_public_payload(created))
 
 
 @router.delete("/delete", status_code=status.HTTP_204_NO_CONTENT)
@@ -79,7 +111,75 @@ async def delete_user(current_user: CurrentUser = Depends(get_current_user)):
 
 @router.get("/users/me", response_model=UserPublic)
 async def read_users_me(current_user: Annotated[CurrentUser, Depends(get_current_user_without_confirmation)]):
-    return UserPublic(**current_user.model_dump(by_alias=True))
+    return UserPublic(**_user_public_payload(current_user.model_dump(by_alias=True)))
+
+
+@router.get("/posts/{username}", response_model=List[PostInDB])
+async def get_posts_by_username(
+    username: str,
+    current_user: Annotated[CurrentUser, Depends(get_current_user_without_confirmation)],
+):
+    user = await users_collection.find_one({"username": username}, {"_id": 1})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    posts = await post_collection.find({"user_id": str(user["_id"])}).sort("publication_date", -1).to_list(None)
+    return [PostInDB(**_post_payload(post)) for post in posts]
+
+
+@router.get("/profile/{user_id}", response_model=UserProfile)
+async def get_user_profile(
+    user_id: str,
+    current_user: Annotated[CurrentUser, Depends(get_current_user_without_confirmation)],
+):
+    user = await users_collection.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    followers = await follows_collection.count_documents({"user_id_followed": user_id})
+    following = await follows_collection.count_documents({"user_id_following": user_id})
+    post_num = await post_collection.count_documents({"user_id": user_id})
+    current_user_id = await get_user_id(current_user.username)
+    is_following_user = False
+    if current_user_id != user_id:
+        is_following_user = (
+            await follows_collection.find_one(
+                {"user_id_following": current_user_id, "user_id_followed": user_id}
+            )
+            is not None
+        )
+
+    return UserProfile(
+        **_user_public_payload(user),
+        followers=followers,
+        following=following,
+        post_num=post_num,
+        is_following=is_following_user,
+    )
+
+
+@router.put("/change_photo_profile")
+async def change_photo_profile(
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    file: UploadFile = File(...),
+):
+    user_id = await get_user_id(current_user.username)
+    image_format = await save_profile_photo(user_id, file)
+    return {
+        "message": "Profile photo updated",
+        "profile_image_url": _profile_image_url(user_id),
+        "image_format": image_format,
+    }
+
+
+@router.delete("/delete_photo_profile")
+async def delete_photo_profile(current_user: Annotated[CurrentUser, Depends(get_current_user)]):
+    user_id = await get_user_id(current_user.username)
+    reset_profile_photo(user_id)
+    return {
+        "message": "Profile photo reset",
+        "profile_image_url": _profile_image_url(user_id),
+    }
 
 
 @router.put("/users/me", response_model=UserPublic)
@@ -89,7 +189,7 @@ async def update_users_me(
 ):
     update_data = payload.model_dump(exclude_unset=True)
     if not update_data:
-        return UserPublic(**current_user.model_dump(by_alias=True))
+        return UserPublic(**_user_public_payload(current_user.model_dump(by_alias=True)))
 
     normalized_username = update_data.get("username")
     if normalized_username is not None:
@@ -118,7 +218,7 @@ async def update_users_me(
     updated_user = await users_collection.find_one({"_id": ObjectId(current_user.id)})
     if not updated_user:
         raise HTTPException(status_code=404, detail="User not found")
-    return UserPublic(**updated_user)
+    return UserPublic(**_user_public_payload(updated_user))
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -127,8 +227,6 @@ async def login_for_access_token(request: Request, form_data: OAuth2PasswordRequ
     user_dict = await users_collection.find_one({"username": form_data.username})
     if not user_dict or not verify_password(form_data.password, user_dict.get("password", "")):
         raise HTTPException(status_code=400, detail="Incorrect username or password")
-    if not user_dict.get("is_active"):
-        raise HTTPException(status_code=403, detail="Account not confirmed")
 
     access_token = create_access_token(user_dict["username"])
     refresh_token, _ = await create_refresh_token(user_dict["username"])
@@ -151,7 +249,17 @@ async def get_saved_posts(current_user: CurrentUser = Depends(get_current_user))
     saved_posts = await interactions_collection.find({"user_id": user_id, "saved_date": {"$exists": True}}).to_list(None)
     for post in saved_posts:
         post["_id"] = str(post["_id"])
-        post["creator_id"] = await get_post_owner_id(post["post_id"])
+        creator_id = await get_post_owner_id(post["post_id"])
+        post["creator_id"] = creator_id
+        original_post = await post_collection.find_one({"_id": ObjectId(post["post_id"])}, {"cover_format": 1, "audio_format": 1})
+        if original_post:
+            post["cover_format"] = original_post.get("cover_format")
+            post["audio_format"] = original_post.get("audio_format")
+            if original_post.get("cover_format"):
+                post["cover_image_url"] = (
+                    f"{settings.media_base_url.rstrip('/')}/{creator_id}/posts/{post['post_id']}/"
+                    f"caratula.{original_post['cover_format']}"
+                )
     return {"saved_posts": saved_posts}
 
 
