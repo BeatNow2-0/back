@@ -174,6 +174,41 @@ async def get_random_publication(current_user: CurrentUser = Depends(get_current
     return await read_publication(str(post_ids[0]["_id"]), current_user, db)
 
 
+@router.get("/feed", response_model=list[PostShowed])
+async def get_feed_publications(
+    limit: int = 8,
+    exclude_ids: str | None = None,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    safe_limit = max(1, min(limit, 20))
+    excluded_object_ids: list[ObjectId] = []
+
+    if exclude_ids:
+        for raw_id in exclude_ids.split(","):
+            raw_id = raw_id.strip()
+            if ObjectId.is_valid(raw_id):
+                excluded_object_ids.append(ObjectId(raw_id))
+
+    match_stage = {"_id": {"$nin": excluded_object_ids}} if excluded_object_ids else {}
+    sample_size = min(max(safe_limit * 3, safe_limit), 60)
+    pipeline = []
+    if match_stage:
+        pipeline.append({"$match": match_stage})
+    pipeline.append({"$sample": {"size": sample_size}})
+
+    sampled_posts = await post_collection.aggregate(pipeline).to_list(length=sample_size)
+    feed_posts: list[PostShowed] = []
+
+    for post in sampled_posts:
+        enriched_post = await read_post(str(post["_id"]), current_user)
+        if enriched_post is not None:
+            feed_posts.append(enriched_post)
+        if len(feed_posts) >= safe_limit:
+            break
+
+    return feed_posts
+
+
 @router.get("/{post_id}", response_model=PostShowed)
 async def read_publication(post_id: str, current_user: CurrentUser = Depends(get_current_user), db=Depends(get_database)):
     readed_post = await read_post(post_id, current_user)
