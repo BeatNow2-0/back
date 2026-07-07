@@ -38,14 +38,22 @@ from model.lyrics_shemas import LyricsInDB
 from model.post_shemas import PostInDB
 from model.user_shemas import CurrentUser, LoginResponse, NewUser, RefreshTokenRequest, UserProfile, UserPublic, UserUpdate
 from routes.mail_routes import send_confirmation_email_to_user
-from services.storage import create_user_directories, delete_user_directories, reset_profile_photo, save_profile_photo
+from services.storage import (
+    create_user_directories,
+    delete_user_directories,
+    reset_profile_photo,
+    resolve_profile_photo_path,
+    save_profile_photo,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
 def _profile_image_url(user_id: str) -> str:
-    return f"{settings.media_base_url.rstrip('/')}/{user_id}/photo_profile/photo_profile.png"
+    profile_path = resolve_profile_photo_path(user_id)
+    suffix = profile_path.suffix if profile_path else settings.default_profile_image.suffix.lower() or ".jpg"
+    return f"{settings.media_base_url.rstrip('/')}/{user_id}/photo_profile/photo_profile{suffix}"
 
 
 def _user_public_payload(user: dict) -> dict:

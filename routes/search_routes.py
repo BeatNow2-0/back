@@ -28,7 +28,12 @@ def _parse_csv(value: Optional[str]) -> list[str]:
 
 
 def _profile_image_url(user_id: object) -> str:
-    return f"{settings.media_base_url.rstrip('/')}/{user_id}/photo_profile/photo_profile.png"
+    from services.storage import resolve_profile_photo_path
+
+    normalized_user_id = str(user_id)
+    profile_path = resolve_profile_photo_path(normalized_user_id)
+    suffix = profile_path.suffix if profile_path else settings.default_profile_image.suffix.lower() or ".jpg"
+    return f"{settings.media_base_url.rstrip('/')}/{normalized_user_id}/photo_profile/photo_profile{suffix}"
 
 
 def _post_payload(post: dict) -> dict:

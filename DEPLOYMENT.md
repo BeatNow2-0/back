@@ -33,7 +33,7 @@ Variables críticas:
 - `SECRET_KEY=<valor largo y aleatorio>`
 - `MONGO_URI=<mongodb+srv://...>`
 - `PUBLIC_BASE_URL=https://app.beatnow.app`
-- `MEDIA_BASE_URL=https://res.beatnow.app/beatnow`
+- `MEDIA_BASE_URL=https://api.beatnow.app/beatnow`
 - `MEDIA_ROOT=/var/lib/beatnow/media`
 - `SMTP_*`
 - `EMAIL_SENDER`
@@ -98,6 +98,8 @@ server {
     }
 }
 ```
+
+El backend sirve media directamente desde `/beatnow/...`, así que no hace falta un host separado para imágenes y audio mientras estés estabilizando producción.
 
 Despues:
 

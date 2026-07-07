@@ -49,6 +49,12 @@ def create_user_directories(user_id: str) -> Path:
     return base
 
 
+def resolve_profile_photo_path(user_id: str) -> Path | None:
+    profile_dir = _safe_user_path(user_id) / "photo_profile"
+    candidates = sorted(profile_dir.glob("photo_profile.*"))
+    return candidates[0] if candidates else None
+
+
 def delete_user_directories(user_id: str) -> None:
     base = _safe_user_path(user_id)
     if base.exists():

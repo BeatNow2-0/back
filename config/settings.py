@@ -57,7 +57,7 @@ class Settings:
     email_sender: str = os.getenv("EMAIL_SENDER", "")
 
     public_base_url: str = os.getenv("PUBLIC_BASE_URL", "https://api.example.com")
-    media_base_url: str = os.getenv("MEDIA_BASE_URL", "https://res.beatnow.app/beatnow")
+    media_base_url: str = os.getenv("MEDIA_BASE_URL", "https://api.beatnow.app/beatnow")
     media_root: Path = Path(os.getenv("MEDIA_ROOT", str(BASE_DIR / "media")))
     default_profile_image: Path = Path(os.getenv("DEFAULT_PROFILE_IMAGE", str(BASE_DIR / "static" / "photo-profile.jpg")))
 

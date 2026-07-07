@@ -32,10 +32,13 @@ jobs:
           key: ${{ secrets.BEATNOW_VPS_SSH_KEY }}
           script: |
             set -e
+            sudo mkdir -p /opt/beatnow-back /var/lib/beatnow/media
             cd /opt/beatnow-back
             python3 -m venv .venv
             . .venv/bin/activate
             pip install --upgrade pip
             pip install -r requirements-production.txt
+            sudo chown -R beatnow:beatnow /opt/beatnow-back /var/lib/beatnow
             sudo systemctl restart beatnow-api
+            sudo systemctl --no-pager --full status beatnow-api
             sudo systemctl reload nginx

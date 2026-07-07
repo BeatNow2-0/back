@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from prometheus_client import start_http_server
 from pymongo.errors import PyMongoError
 
@@ -91,3 +94,32 @@ async def readyz():
         "database_ready": getattr(app.state, "database_ready", False),
         "database_error": getattr(app.state, "database_error", None),
     }
+
+
+def _resolve_media_path(requested_path: str) -> Path:
+    base = settings.media_root.resolve()
+    candidate = (base / requested_path).resolve()
+
+    try:
+        candidate.relative_to(base)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="File not found") from exc
+
+    if candidate.exists() and candidate.is_file():
+        return candidate
+
+    # Backward compatibility: some clients still request photo_profile.png even
+    # when the stored image is jpg/webp.
+    if candidate.name == "photo_profile.png":
+        fallback_matches = sorted(candidate.parent.glob("photo_profile.*"))
+        for fallback in fallback_matches:
+            if fallback.is_file():
+                return fallback
+
+    raise HTTPException(status_code=404, detail="File not found")
+
+
+@app.get("/beatnow/{requested_path:path}", include_in_schema=False)
+async def serve_media(requested_path: str):
+    media_file = _resolve_media_path(requested_path)
+    return FileResponse(media_file)
