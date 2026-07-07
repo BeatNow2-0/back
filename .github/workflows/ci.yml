@@ -1,0 +1,38 @@
+name: Backend CI
+
+on:
+  push:
+    paths:
+      - '**.py'
+      - 'requirements*.txt'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - '**.py'
+      - 'requirements*.txt'
+      - '.github/workflows/ci.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        env:
+          ENVIRONMENT: test
+          SECRET_KEY: test-secret-key-with-sufficient-length-123456
+          MONGO_DB: BeatNow_test
+        run: pytest tests -q

@@ -1,0 +1,41 @@
+name: Deploy Backend To VPS
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Copy project to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.BEATNOW_VPS_HOST }}
+          username: ${{ secrets.BEATNOW_VPS_USER }}
+          key: ${{ secrets.BEATNOW_VPS_SSH_KEY }}
+          source: "."
+          target: "/opt/beatnow-back"
+          strip_components: 0
+
+      - name: Deploy on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.BEATNOW_VPS_HOST }}
+          username: ${{ secrets.BEATNOW_VPS_USER }}
+          key: ${{ secrets.BEATNOW_VPS_SSH_KEY }}
+          script: |
+            set -e
+            cd /opt/beatnow-back
+            python3 -m venv .venv
+            . .venv/bin/activate
+            pip install --upgrade pip
+            pip install -r requirements-production.txt
+            sudo systemctl restart beatnow-api
+            sudo systemctl reload nginx

@@ -36,7 +36,11 @@ async def lifespan(app: FastAPI):
     if settings.prometheus_enabled:
         start_http_server(settings.prometheus_port)
     app.state.change_stream_task = None
-    if app.state.database_ready and settings.environment != "test":
+    if (
+        app.state.database_ready
+        and settings.environment != "test"
+        and settings.enable_change_stream_sync
+    ):
         try:
             import asyncio
 

@@ -284,14 +284,12 @@ async def add_view(post_id: str, current_user: NewUser = Depends(get_current_use
                     # si last_view viene en otro formato, contamos por seguridad
                     should_count_view = True
 
-        # 3) siempre actualizamos el documento de interacción con el último timestamp
-        # guardamos last_view y opcionalmente push a array "views" con el timestamp
-        # (usar $push puede llevar a arrays grandes; si no lo necesitas, puedes comentar ese $push)
+        # 3) siempre actualizamos el documento de interacción con el último timestamp.
+        # No guardamos historial completo de views para evitar crecimiento no acotado.
         await interactions_collection.update_one(
             {"user_id": user_id, "post_id": post_key},
             {
                 "$set": {"last_view": now, "user_id": user_id, "post_id": post_key},
-                "$push": {"views": now}  # opcional: historial por usuario
             },
             upsert=True
         )

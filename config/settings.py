@@ -68,12 +68,16 @@ class Settings:
 
     prometheus_enabled: bool = os.getenv("PROMETHEUS_ENABLED", "false").lower() == "true"
     prometheus_port: int = int(os.getenv("PROMETHEUS_PORT", "9000"))
+    enable_change_stream_sync: bool = os.getenv("ENABLE_CHANGE_STREAM_SYNC", "false").lower() == "true"
 
     def __post_init__(self) -> None:
         self.cors_origins = _split_csv(
             os.getenv(
                 "CORS_ORIGINS",
-                "https://app.beatnow.app,http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173",
+                (
+                    "https://app.beatnow.app,https://beatnow.app,https://www.beatnow.app,"
+                    "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://localhost:5174"
+                ),
             )
         )
         self.media_root.mkdir(parents=True, exist_ok=True)

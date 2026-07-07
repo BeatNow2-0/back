@@ -2,6 +2,9 @@
 
 Backend API built with FastAPI and MongoDB.
 
+Deployment guide: see [DEPLOYMENT.md](/Users/hugogarcia/projects/beatnow/back/DEPLOYMENT.md).
+Launch plan: see [LAUNCH_ROADMAP.md](/Users/hugogarcia/projects/beatnow/back/LAUNCH_ROADMAP.md).
+
 ## Local development
 
 ```bash
@@ -11,6 +14,8 @@ pip install -r requirements-production.txt
 cp .env.example .env
 uvicorn main:app --reload
 ```
+
+`ENABLE_CHANGE_STREAM_SYNC` is disabled by default. Enable it only if your MongoDB deployment supports change streams and you explicitly want counter reconciliation in the background.
 
 ## Production deployment (Ubuntu VPS)
 
