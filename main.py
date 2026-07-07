@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from prometheus_client import start_http_server
+from prometheus_fastapi_instrumentator import Instrumentator
 from pymongo.errors import PyMongoError
 
 from config.changeStream import watch_changes
@@ -36,8 +36,6 @@ async def lifespan(app: FastAPI):
     app.state.database_ready = await ensure_indexes()
     if not app.state.database_ready and app.state.database_error is None:
         app.state.database_error = "MongoDB unavailable during startup"
-    if settings.prometheus_enabled:
-        start_http_server(settings.prometheus_port)
     app.state.change_stream_task = None
     if (
         app.state.database_ready
@@ -57,6 +55,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, debug=settings.debug, lifespan=lifespan)
+
+if settings.prometheus_enabled:
+    Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 app.add_exception_handler(PyMongoError, handle_database_error)
 app.add_exception_handler(Exception, unhandled_exception_handler)
 app.add_middleware(SecurityHeadersMiddleware)

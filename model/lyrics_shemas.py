@@ -1,3 +1,4 @@
+from typing import Optional
 
 from bson import ObjectId
 from pydantic import BaseModel, Field, validator
@@ -5,7 +6,7 @@ from pydantic import BaseModel, Field, validator
 class NewLyrics(BaseModel):
     title: str = Field(alias="title")
     lyrics: str = Field(alias="lyrics")
-    post_id: str = Field(alias="post_id")
+    post_id: Optional[str] = Field(default=None, alias="post_id")
     
 class Lyrics(NewLyrics):
     user_id: str = Field(alias="user_id")

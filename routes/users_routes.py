@@ -259,14 +259,40 @@ async def get_saved_posts(current_user: CurrentUser = Depends(get_current_user))
         post["_id"] = str(post["_id"])
         creator_id = await get_post_owner_id(post["post_id"])
         post["creator_id"] = creator_id
-        original_post = await post_collection.find_one({"_id": ObjectId(post["post_id"])}, {"cover_format": 1, "audio_format": 1})
+        original_post = await post_collection.find_one(
+            {"_id": ObjectId(post["post_id"])},
+            {
+                "cover_format": 1,
+                "audio_format": 1,
+                "title": 1,
+                "genre": 1,
+                "bpm": 1,
+                "description": 1,
+                "tags": 1,
+                "moods": 1,
+                "instruments": 1,
+            },
+        )
         if original_post:
             post["cover_format"] = original_post.get("cover_format")
             post["audio_format"] = original_post.get("audio_format")
+            post["title"] = original_post.get("title")
+            post["genre"] = original_post.get("genre")
+            post["bpm"] = original_post.get("bpm")
+            post["description"] = original_post.get("description")
+            post["tags"] = original_post.get("tags") or []
+            post["moods"] = original_post.get("moods") or []
+            post["instruments"] = original_post.get("instruments") or []
+            post["creator_username"] = await get_username(creator_id)
             if original_post.get("cover_format"):
                 post["cover_image_url"] = (
                     f"{settings.media_base_url.rstrip('/')}/{creator_id}/posts/{post['post_id']}/"
                     f"caratula.{original_post['cover_format']}"
+                )
+            if original_post.get("audio_format"):
+                post["audio_url"] = (
+                    f"{settings.media_base_url.rstrip('/')}/{creator_id}/posts/{post['post_id']}/"
+                    f"audio.{original_post['audio_format']}"
                 )
     return {"saved_posts": saved_posts}
 
