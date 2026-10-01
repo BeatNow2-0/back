@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import logging
 
-import jwt
 from typing import Annotated, List
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.security import OAuth2PasswordRequestForm
+from pymongo.errors import DuplicateKeyError
 
 from config.db import (
     follows_collection,
@@ -16,68 +16,58 @@ from config.db import (
     lyrics_collection,
     password_reset_collection,
     post_collection,
-    refresh_tokens_collection,
     users_collection,
 )
 from config.security import (
-    create_access_token,
-    create_refresh_token,
+    authenticate_user,
+    consume_refresh_token,
     get_current_user,
     get_current_user_without_confirmation,
-    get_post_owner_id,
     get_user,
     get_user_id,
-    revoke_refresh_token,
-    validate_refresh_token,
-    verify_password,
+    revoke_all_refresh_tokens,
+    revoke_refresh_token_value,
+    issue_token_pair,
     hash_password,
 )
 from config.settings import settings
 from core.rate_limit import enforce_rate_limit
+from core.mongo import parse_object_id
 from model.lyrics_shemas import LyricsInDB
 from model.post_shemas import PostInDB
-from model.user_shemas import CurrentUser, LoginResponse, NewUser, RefreshTokenRequest, UserProfile, UserPublic, UserUpdate
+from model.user_shemas import CurrentUser, LoginResponse, RefreshTokenRequest, RegisterRequest, UserProfile, UserPublic, UserUpdate
 from routes.mail_routes import send_confirmation_email_to_user
 from services.storage import (
     create_user_directories,
     delete_user_directories,
-    reset_profile_photo,
-    resolve_profile_photo_path,
-    save_profile_photo,
+    media_url,
+    prepare_avatar,
+    profile_media_url,
+    storage,
+    with_post_media_urls,
 )
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-def _profile_image_url(user_id: str) -> str:
-    profile_path = resolve_profile_photo_path(user_id)
-    suffix = profile_path.suffix if profile_path else settings.default_profile_image.suffix.lower() or ".jpg"
-    return f"{settings.media_base_url.rstrip('/')}/{user_id}/photo_profile/photo_profile{suffix}"
+def _profile_image_url(user: dict) -> str | None:
+    return profile_media_url(user)
 
 
 def _user_public_payload(user: dict) -> dict:
     payload = dict(user)
-    payload["profile_image_url"] = _profile_image_url(str(user["_id"]))
+    payload["profile_image_url"] = _profile_image_url(user)
     return payload
 
 
 def _post_payload(post: dict) -> dict:
-    payload = dict(post)
-    post_id = str(payload.get("_id", ""))
-    user_id = str(payload.get("user_id", ""))
-    cover_format = payload.get("cover_format")
-    audio_format = payload.get("audio_format")
-    base_url = settings.media_base_url.rstrip("/")
-    if post_id and user_id and cover_format:
-        payload["cover_image_url"] = f"{base_url}/{user_id}/posts/{post_id}/caratula.{cover_format}"
-    if post_id and user_id and audio_format:
-        payload["audio_url"] = f"{base_url}/{user_id}/posts/{post_id}/audio.{audio_format}"
-    return payload
+    return with_post_media_urls(post)
 
 
 @router.post("/register", response_model=UserPublic, status_code=status.HTTP_201_CREATED)
-async def register(user: NewUser):
+async def register(user: RegisterRequest, request: Request):
+    await enforce_rate_limit(request, f"register:{user.username}", settings.register_rate_limit)
     if await users_collection.find_one({"username": user.username}):
         raise HTTPException(status_code=400, detail="Username already registered")
     if await users_collection.find_one({"email": user.email}):
@@ -85,7 +75,11 @@ async def register(user: NewUser):
 
     user_dict = user.model_dump()
     user_dict["password"] = hash_password(user.password)
-    result = await users_collection.insert_one(user_dict)
+    user_dict["is_active"] = False
+    try:
+        result = await users_collection.insert_one(user_dict)
+    except DuplicateKeyError as exc:
+        raise HTTPException(status_code=400, detail="Username or email already registered") from exc
     user_id = str(result.inserted_id)
     create_user_directories(user_id)
     created = await users_collection.find_one({"_id": result.inserted_id})
@@ -94,15 +88,16 @@ async def register(user: NewUser):
         try:
             await send_confirmation_email_to_user(current_user)
         except Exception:
-            logger.exception("Failed to send confirmation email for user %s", current_user.username)
+            logger.exception("Failed to send confirmation email")
     return UserPublic(**_user_public_payload(created))
 
 
 @router.delete("/delete", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_user(current_user: CurrentUser = Depends(get_current_user)):
     user_id = await get_user_id(current_user.username)
-    user_posts = await post_collection.find({"user_id": user_id}, {"_id": 1}).to_list(None)
-    post_ids = [post["_id"] for post in user_posts]
+    post_ids = []
+    async for post in post_collection.find({"user_id": user_id}, {"_id": 1}):
+        post_ids.append(post["_id"])
 
     await follows_collection.delete_many({"user_id_following": user_id})
     await follows_collection.delete_many({"user_id_followed": user_id})
@@ -111,9 +106,9 @@ async def delete_user(current_user: CurrentUser = Depends(get_current_user)):
     await interactions_collection.delete_many({"user_id": user_id})
     await post_collection.delete_many({"user_id": user_id})
     await password_reset_collection.delete_many({"user_id": user_id})
-    await refresh_tokens_collection.delete_many({"username": current_user.username})
-    await users_collection.delete_one({"_id": ObjectId(user_id)})
-    delete_user_directories(user_id)
+    await revoke_all_refresh_tokens(user_id, current_user.username)
+    await users_collection.delete_one({"_id": parse_object_id(user_id, field="user identifier")})
+    delete_user_directories(user_id, [str(post_id) for post_id in post_ids])
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -126,12 +121,14 @@ async def read_users_me(current_user: Annotated[CurrentUser, Depends(get_current
 async def get_posts_by_username(
     username: str,
     current_user: Annotated[CurrentUser, Depends(get_current_user_without_confirmation)],
+    limit: int = Query(50, ge=1, le=100),
+    skip: int = Query(0, ge=0, le=10000),
 ):
     user = await users_collection.find_one({"username": username}, {"_id": 1})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    posts = await post_collection.find({"user_id": str(user["_id"])}).sort("publication_date", -1).to_list(None)
+    posts = await post_collection.find({"user_id": str(user["_id"])}).sort("publication_date", -1).skip(skip).limit(limit).to_list(length=limit)
     return [PostInDB(**_post_payload(post)) for post in posts]
 
 
@@ -140,7 +137,7 @@ async def get_user_profile(
     user_id: str,
     current_user: Annotated[CurrentUser, Depends(get_current_user_without_confirmation)],
 ):
-    user = await users_collection.find_one({"_id": ObjectId(user_id)})
+    user = await users_collection.find_one({"_id": parse_object_id(user_id, field="user identifier")})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -172,21 +169,46 @@ async def change_photo_profile(
     file: UploadFile = File(...),
 ):
     user_id = await get_user_id(current_user.username)
-    image_format = await save_profile_photo(user_id, file)
+    user_object_id = parse_object_id(user_id, field="user identifier")
+    current_document = await users_collection.find_one({"_id": user_object_id}, {"avatar_key": 1})
+    if not current_document:
+        raise HTTPException(status_code=404, detail="User not found")
+    media_batch = await prepare_avatar(user_id, file, current_document.get("avatar_key"))
+    try:
+        media_batch.apply()
+        result = await users_collection.update_one(
+            {"_id": user_object_id},
+            {"$set": media_batch.database_fields},
+        )
+        if result.matched_count == 0:
+            raise RuntimeError("User disappeared while updating avatar")
+    except Exception:
+        media_batch.rollback()
+        raise
+    media_batch.finalize()
+    profile_url = media_url(media_batch.database_fields["avatar_key"])
     return {
         "message": "Profile photo updated",
-        "profile_image_url": _profile_image_url(user_id),
-        "image_format": image_format,
+        "profile_image_url": profile_url,
+        "photo_profile": profile_url,
+        "image_format": "webp",
     }
 
 
 @router.delete("/delete_photo_profile")
 async def delete_photo_profile(current_user: Annotated[CurrentUser, Depends(get_current_user)]):
     user_id = await get_user_id(current_user.username)
-    reset_profile_photo(user_id)
+    user_object_id = parse_object_id(user_id, field="user identifier")
+    user = await users_collection.find_one({"_id": user_object_id}, {"avatar_key": 1})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    await users_collection.update_one({"_id": user_object_id}, {"$unset": {"avatar_key": ""}})
+    avatar_key = user.get("avatar_key") or storage.generate_key("avatars", user_id, "avatar.webp")
+    storage.delete(avatar_key)
     return {
         "message": "Profile photo reset",
-        "profile_image_url": _profile_image_url(user_id),
+        "profile_image_url": None,
+        "photo_profile": None,
     }
 
 
@@ -221,9 +243,14 @@ async def update_users_me(
         update_data["bio"] = normalized_bio or None
 
     if update_data:
-        await users_collection.update_one({"_id": ObjectId(current_user.id)}, {"$set": update_data})
+        await users_collection.update_one(
+            {"_id": parse_object_id(current_user.id, field="user identifier")},
+            {"$set": update_data},
+        )
 
-    updated_user = await users_collection.find_one({"_id": ObjectId(current_user.id)})
+    updated_user = await users_collection.find_one(
+        {"_id": parse_object_id(current_user.id, field="user identifier")}
+    )
     if not updated_user:
         raise HTTPException(status_code=404, detail="User not found")
     return UserPublic(**_user_public_payload(updated_user))
@@ -232,84 +259,78 @@ async def update_users_me(
 @router.post("/login", response_model=LoginResponse)
 async def login_for_access_token(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
     await enforce_rate_limit(request, f"login:{form_data.username}", settings.login_rate_limit)
-    user_dict = await users_collection.find_one({"username": form_data.username})
-    if not user_dict or not verify_password(form_data.password, user_dict.get("password", "")):
-        raise HTTPException(status_code=400, detail="Incorrect username or password")
-
-    access_token = create_access_token(user_dict["username"])
-    refresh_token, _ = await create_refresh_token(user_dict["username"])
+    user = await authenticate_user(form_data.username, form_data.password)
+    access_token, refresh_token = await issue_token_pair(user)
     return LoginResponse(access_token=access_token, refresh_token=refresh_token)
 
 
 @router.post("/refresh", response_model=LoginResponse)
 async def refresh_access_token(payload: RefreshTokenRequest):
-    user = await validate_refresh_token(payload.refresh_token)
-    decoded = jwt.decode(payload.refresh_token, settings.secret_key, algorithms=[settings.algorithm], issuer=settings.app_name)
-    await revoke_refresh_token(decoded["jti"])
-    access_token = create_access_token(user.username)
-    refresh_token, _ = await create_refresh_token(user.username)
+    user = await consume_refresh_token(payload.refresh_token)
+    access_token, refresh_token = await issue_token_pair(user)
     return LoginResponse(access_token=access_token, refresh_token=refresh_token)
 
 
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def logout(payload: RefreshTokenRequest):
+    await revoke_refresh_token_value(payload.refresh_token)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.get("/saved-posts")
-async def get_saved_posts(current_user: CurrentUser = Depends(get_current_user)):
+async def get_saved_posts(
+    limit: int = Query(50, ge=1, le=100),
+    skip: int = Query(0, ge=0, le=10000),
+    current_user: CurrentUser = Depends(get_current_user),
+):
     user_id = await get_user_id(current_user.username)
-    saved_posts = await interactions_collection.find({"user_id": user_id, "saved_date": {"$exists": True}}).to_list(None)
+    saved_posts = await interactions_collection.find({"user_id": user_id, "saved_date": {"$exists": True}}).sort("saved_date", -1).skip(skip).limit(limit).to_list(length=limit)
+    valid_post_ids = [post["post_id"] for post in saved_posts if ObjectId.is_valid(post.get("post_id"))]
+    object_ids = [parse_object_id(post_id, field="post identifier") for post_id in valid_post_ids]
+    original_posts = await post_collection.find({"_id": {"$in": object_ids}}).to_list(length=len(object_ids))
+    post_map = {str(post["_id"]): post for post in original_posts}
+    owner_ids = {str(post.get("user_id")) for post in original_posts if post.get("user_id")}
+    owners = await users_collection.find(
+        {"_id": {"$in": [parse_object_id(owner_id, field="user identifier") for owner_id in owner_ids]}},
+        {"username": 1},
+    ).to_list(length=len(owner_ids))
+    username_map = {str(owner["_id"]): owner.get("username") for owner in owners}
+    enriched_posts = []
     for post in saved_posts:
         post["_id"] = str(post["_id"])
-        creator_id = await get_post_owner_id(post["post_id"])
+        original_post = post_map.get(post.get("post_id"))
+        if not original_post:
+            continue
+        creator_id = str(original_post["user_id"])
         post["creator_id"] = creator_id
-        original_post = await post_collection.find_one(
-            {"_id": ObjectId(post["post_id"])},
-            {
-                "cover_format": 1,
-                "audio_format": 1,
-                "title": 1,
-                "genre": 1,
-                "bpm": 1,
-                "description": 1,
-                "tags": 1,
-                "moods": 1,
-                "instruments": 1,
-            },
-        )
-        if original_post:
-            post["cover_format"] = original_post.get("cover_format")
-            post["audio_format"] = original_post.get("audio_format")
-            post["title"] = original_post.get("title")
-            post["genre"] = original_post.get("genre")
-            post["bpm"] = original_post.get("bpm")
-            post["description"] = original_post.get("description")
-            post["tags"] = original_post.get("tags") or []
-            post["moods"] = original_post.get("moods") or []
-            post["instruments"] = original_post.get("instruments") or []
-            post["creator_username"] = await get_username(creator_id)
-            if original_post.get("cover_format"):
-                post["cover_image_url"] = (
-                    f"{settings.media_base_url.rstrip('/')}/{creator_id}/posts/{post['post_id']}/"
-                    f"caratula.{original_post['cover_format']}"
-                )
-            if original_post.get("audio_format"):
-                post["audio_url"] = (
-                    f"{settings.media_base_url.rstrip('/')}/{creator_id}/posts/{post['post_id']}/"
-                    f"audio.{original_post['audio_format']}"
-                )
-    return {"saved_posts": saved_posts}
+        post.update({key: value for key, value in with_post_media_urls(original_post).items() if key != "_id"})
+        post["creator_username"] = username_map.get(creator_id)
+        enriched_posts.append(post)
+    return {"saved_posts": enriched_posts}
 
 
 @router.get("/liked-posts")
-async def get_liked_posts(current_user: CurrentUser = Depends(get_current_user)):
+async def get_liked_posts(
+    limit: int = Query(50, ge=1, le=100),
+    skip: int = Query(0, ge=0, le=10000),
+    current_user: CurrentUser = Depends(get_current_user),
+):
     user_id = await get_user_id(current_user.username)
-    liked_posts = await interactions_collection.find({"user_id": user_id, "like_date": {"$exists": True}}).to_list(None)
+    liked_posts = await interactions_collection.find({"user_id": user_id, "like_date": {"$exists": True}}).sort("like_date", -1).skip(skip).limit(limit).to_list(length=limit)
     for post in liked_posts:
         post["_id"] = str(post["_id"])
     return {"liked_posts": liked_posts}
 
 
 @router.get("/lyrics", response_model=List[LyricsInDB])
-async def get_user_lyrics(current_user: CurrentUser = Depends(get_current_user), db=Depends(get_database)):
+async def get_user_lyrics(
+    limit: int = Query(50, ge=1, le=100),
+    skip: int = Query(0, ge=0, le=10000),
+    current_user: CurrentUser = Depends(get_current_user),
+    db=Depends(get_database),
+):
     user_id = await get_user_id(current_user.username)
-    user_lyrics = await lyrics_collection.find({"user_id": user_id}).to_list(None)
+    user_lyrics = await lyrics_collection.find({"user_id": user_id}).skip(skip).limit(limit).to_list(length=limit)
     for lyric in user_lyrics:
         lyric["_id"] = str(lyric["_id"])
     return user_lyrics

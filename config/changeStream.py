@@ -31,6 +31,6 @@ async def watch_changes():
                     await post_collection.update_one({"_id": ObjectId(post_id)}, {"$set": {"likes": likes, "saves": saves}})
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            logger.warning("Change stream watcher failed: %s", exc)
+        except Exception:
+            logger.warning("Change stream watcher failed")
             await asyncio.sleep(5)

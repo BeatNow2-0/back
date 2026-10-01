@@ -1,21 +1,20 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from pathlib import Path
-
 from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 from pymongo.errors import PyMongoError
 
 from config.changeStream import watch_changes
-from config.db import DATABASE_CONFIGURATION_ERROR, ensure_indexes, handle_database_error
+from config.db import DATABASE_CONFIGURATION_ERROR, ensure_indexes, handle_database_error, ping_database
 from config.settings import settings
-from core.exceptions import unhandled_exception_handler
+from core.exceptions import http_exception_handler, unhandled_exception_handler
 from core.logging import configure_logging
 from core.security_headers import SecurityHeadersMiddleware
+from core.request_context import RequestContextMiddleware
 from routes.download_routes import router as download_router
 from routes.filter_routes import router as filter_router
 from routes.follow_routes import router as follow_router
@@ -26,6 +25,7 @@ from routes.posts_routes import router as posts_router
 from routes.routes import router as routes_router
 from routes.search_routes import router as search_router
 from routes.users_routes import router as users_router
+from services.storage import StorageError, storage, storage_ready
 
 configure_logging()
 
@@ -59,8 +59,10 @@ app = FastAPI(title=settings.app_name, debug=settings.debug, lifespan=lifespan)
 if settings.prometheus_enabled:
     Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 app.add_exception_handler(PyMongoError, handle_database_error)
+app.add_exception_handler(HTTPException, http_exception_handler)
 app.add_exception_handler(Exception, unhandled_exception_handler)
 app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestContextMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -90,37 +92,23 @@ async def healthz():
 
 @app.get("/readyz", tags=["health"])
 async def readyz():
-    return {
-        "status": "ready" if getattr(app.state, "database_ready", False) else "degraded",
-        "database_ready": getattr(app.state, "database_ready", False),
-        "database_error": getattr(app.state, "database_error", None),
+    database_ready = await ping_database()
+    media_ready = storage_ready()
+    ready = database_ready and media_ready
+    payload = {
+        "status": "ready" if ready else "not_ready",
+        "database_ready": database_ready,
+        "storage_ready": media_ready,
     }
-
-
-def _resolve_media_path(requested_path: str) -> Path:
-    base = settings.media_root.resolve()
-    candidate = (base / requested_path).resolve()
-
-    try:
-        candidate.relative_to(base)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="File not found") from exc
-
-    if candidate.exists() and candidate.is_file():
-        return candidate
-
-    # Backward compatibility: some clients still request photo_profile.png even
-    # when the stored image is jpg/webp.
-    if candidate.name == "photo_profile.png":
-        fallback_matches = sorted(candidate.parent.glob("photo_profile.*"))
-        for fallback in fallback_matches:
-            if fallback.is_file():
-                return fallback
-
-    raise HTTPException(status_code=404, detail="File not found")
+    if not ready:
+        return JSONResponse(status_code=503, content=payload)
+    return payload
 
 
 @app.get("/beatnow/{requested_path:path}", include_in_schema=False)
 async def serve_media(requested_path: str):
-    media_file = _resolve_media_path(requested_path)
-    return FileResponse(media_file)
+    try:
+        target = storage.get_public_url(requested_path)
+    except StorageError as exc:
+        raise HTTPException(status_code=404, detail="File not found") from exc
+    return RedirectResponse(target, status_code=308)

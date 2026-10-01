@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import ipaddress
 from collections import defaultdict, deque
 from typing import Deque, DefaultDict
 
@@ -16,9 +17,23 @@ def _cleanup(bucket: Deque[float], now: float, window: int) -> None:
         bucket.popleft()
 
 
+def get_client_ip(request: Request) -> str:
+    peer = request.client.host if request.client else "unknown"
+    if peer not in settings.trusted_proxy_ips:
+        return peer
+    forwarded = getattr(request, "headers", {}).get("x-forwarded-for", "")
+    candidate = forwarded.split(",", 1)[0].strip()
+    if not candidate:
+        return peer
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return peer
+
+
 async def enforce_rate_limit(request: Request, key: str, limit: int, window: int | None = None) -> None:
     window = window or settings.rate_limit_window_seconds
-    identity = request.client.host if request.client else "unknown"
+    identity = get_client_ip(request)
     bucket_key = f"{key}:{identity}"
     now = time.time()
     bucket = _BUCKETS[bucket_key]

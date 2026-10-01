@@ -1,7 +1,11 @@
 .venv/
+venv/
 beatnowvenv/
 __pycache__/
+*.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 .env
 
@@ -9,4 +13,14 @@ __pycache__/
 .vscode/
 
 app.log
+*.log
 media/
+certificates/
+certs/
+*.pem
+*.key
+*.crt
+dumps/
+backups/
+*.dump
+*.archive

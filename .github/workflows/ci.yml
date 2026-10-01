@@ -35,4 +35,8 @@ jobs:
           ENVIRONMENT: test
           SECRET_KEY: test-secret-key-with-sufficient-length-123456
           MONGO_DB: BeatNow_test
-        run: pytest tests -q
+        run: |
+          pytest tests -q
+          python -m compileall -q main.py config core model routes services tests scripts
+          python -c "from main import app"
+          pip check

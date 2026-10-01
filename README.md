@@ -2,15 +2,15 @@
 
 Backend API built with FastAPI and MongoDB.
 
-Deployment guide: see [DEPLOYMENT.md](/Users/hugogarcia/projects/beatnow/back/DEPLOYMENT.md).
-Launch plan: see [LAUNCH_ROADMAP.md](/Users/hugogarcia/projects/beatnow/back/LAUNCH_ROADMAP.md).
+Deployment guide: see [DEPLOYMENT.md](DEPLOYMENT.md).
+Launch plan: see [LAUNCH_ROADMAP.md](LAUNCH_ROADMAP.md).
 
 ## Local development
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements-production.txt
+pip install -r requirements-dev.txt
 cp .env.example .env
 uvicorn main:app --reload
 ```
@@ -41,16 +41,10 @@ MONGO_DB=BeatNow
 
 `MONGO_URI` takes precedence if it is set.
 
-Run behind **Nginx** and **Gunicorn/Uvicorn workers**.
+Production runs Uvicorn on `127.0.0.1:8001` behind Nginx. Public media is written through `StorageProvider` and served only by Nginx from `https://res.beatnow.app`.
 
 ```bash
-gunicorn main:app \
-  -k uvicorn.workers.UvicornWorker \
-  --workers 4 \
-  --bind 127.0.0.1:8001 \
-  --timeout 60 \
-  --access-logfile - \
-  --error-logfile -
+uvicorn main:app --host 127.0.0.1 --port 8001
 ```
 
 Recommended systemd service:
@@ -65,9 +59,15 @@ User=beatnow
 Group=beatnow
 WorkingDirectory=/opt/beatnow-back
 EnvironmentFile=/etc/beatnow/api.env
-ExecStart=/opt/beatnow-back/.venv/bin/gunicorn main:app -k uvicorn.workers.UvicornWorker --workers 4 --bind 127.0.0.1:8001 --timeout 60 --access-logfile - --error-logfile -
+ExecStart=/opt/beatnow-back/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8001
 Restart=always
 RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/beatnow/media
+UMask=0027
 
 [Install]
 WantedBy=multi-user.target

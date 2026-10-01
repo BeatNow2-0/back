@@ -6,8 +6,10 @@ pymongo==4.6.3
 passlib==1.7.4
 bcrypt==4.1.2
 PyJWT==2.8.0
-python-multipart==0.0.9
+python-multipart==0.0.32
 prometheus_client==0.20.0
+prometheus-fastapi-instrumentator==7.1.0
 python-dotenv==1.0.1
 requests==2.31.0
-pytest==8.1.1
+Pillow==12.3.0
+mutagen==1.48.1

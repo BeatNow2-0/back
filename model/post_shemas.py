@@ -15,6 +15,18 @@ class NewPost(BaseModel):
     moods: Optional[List[str]] = Field(default=None, max_length=20)
     instruments: Optional[List[str]] = Field(default=None, max_length=20)
     bpm: Optional[int] = Field(default=None, ge=1, le=400)
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+
+class PostUpdate(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    description: Optional[str] = Field(default=None, max_length=1000)
+    tags: Optional[List[str]] = Field(default=None, max_length=20)
+    genre: Optional[str] = Field(default=None, max_length=60)
+    moods: Optional[List[str]] = Field(default=None, max_length=20)
+    instruments: Optional[List[str]] = Field(default=None, max_length=20)
+    bpm: Optional[int] = Field(default=None, ge=1, le=400)
+    model_config = ConfigDict(str_strip_whitespace=True)
 
 
 class Post(NewPost):
@@ -27,6 +39,9 @@ class Post(NewPost):
     views: int = 0
     audio_url: Optional[str] = None
     cover_image_url: Optional[str] = None
+    caratula: Optional[str] = None
+    audio_key: Optional[str] = None
+    cover_key: Optional[str] = None
 
 
 class PostInDB(Post):

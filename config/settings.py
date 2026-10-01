@@ -57,14 +57,20 @@ class Settings:
     email_sender: str = os.getenv("EMAIL_SENDER", "")
 
     public_base_url: str = os.getenv("PUBLIC_BASE_URL", "https://api.example.com")
-    media_base_url: str = os.getenv("MEDIA_BASE_URL", "https://api.beatnow.app/beatnow")
-    media_root: Path = Path(os.getenv("MEDIA_ROOT", str(BASE_DIR / "media")))
-    default_profile_image: Path = Path(os.getenv("DEFAULT_PROFILE_IMAGE", str(BASE_DIR / "static" / "photo-profile.jpg")))
-
+    media_base_url: str = os.getenv("MEDIA_BASE_URL", "https://res.beatnow.app")
+    media_root: Path = Path(os.getenv("MEDIA_ROOT", "/srv/beatnow/media"))
+    storage_provider: str = os.getenv("STORAGE_PROVIDER", "local")
+    max_image_upload_size: int = int(os.getenv("MAX_IMAGE_UPLOAD_SIZE", str(10 * 1024 * 1024)))
+    max_audio_upload_size: int = int(os.getenv("MAX_AUDIO_UPLOAD_SIZE", str(50 * 1024 * 1024)))
+    max_image_dimension: int = int(os.getenv("MAX_IMAGE_DIMENSION", "4096"))
+    max_image_pixels: int = int(os.getenv("MAX_IMAGE_PIXELS", "40000000"))
     rate_limit_window_seconds: int = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
     login_rate_limit: int = int(os.getenv("LOGIN_RATE_LIMIT", "5"))
+    register_rate_limit: int = int(os.getenv("REGISTER_RATE_LIMIT", "3"))
     reset_rate_limit: int = int(os.getenv("RESET_RATE_LIMIT", "3"))
     confirmation_rate_limit: int = int(os.getenv("CONFIRMATION_RATE_LIMIT", "5"))
+    confirmation_max_attempts: int = int(os.getenv("CONFIRMATION_MAX_ATTEMPTS", "5"))
+    trusted_proxy_ips: List[str] = None  # type: ignore[assignment]
 
     prometheus_enabled: bool = os.getenv("PROMETHEUS_ENABLED", "false").lower() == "true"
     prometheus_port: int = int(os.getenv("PROMETHEUS_PORT", "9000"))
@@ -80,7 +86,9 @@ class Settings:
                 ),
             )
         )
-        self.media_root.mkdir(parents=True, exist_ok=True)
+        self.trusted_proxy_ips = _split_csv(os.getenv("TRUSTED_PROXY_IPS", "127.0.0.1,::1"))
+        if self.storage_provider != "local":
+            raise RuntimeError(f"Unsupported STORAGE_PROVIDER: {self.storage_provider}")
         if self.environment == "production":
             if not self.secret_key or self.secret_key == "tu_super_secreto":
                 raise RuntimeError("SECRET_KEY must be configured with a strong value in production")

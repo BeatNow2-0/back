@@ -7,6 +7,7 @@ import bcrypt
 import jwt
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from pymongo import ReturnDocument
 
 from config.db import mail_code_collection, password_reset_collection, users_collection
 from config.mail import send_email
@@ -20,9 +21,11 @@ from config.security import (
     get_user_by_email,
     get_user_id,
     hash_password,
+    revoke_all_refresh_tokens,
 )
 from config.settings import settings
 from core.rate_limit import enforce_rate_limit
+from core.mongo import parse_object_id
 from model.shemas import MailCode
 from model.user_shemas import ConfirmationRequest, CurrentUser, PasswordResetConfirm, PasswordResetRequest
 
@@ -42,8 +45,9 @@ async def create_and_save_confirmation_code(user: CurrentUser) -> str:
         code=code_hash,
         expires_at=_utcnow() + timedelta(minutes=CONFIRMATION_CODE_EXPIRE_MINUTES),
     )
-    await mail_code_collection.delete_many({"user_id": user_id})
-    await mail_code_collection.insert_one(mail_code.model_dump())
+    code_document = mail_code.model_dump()
+    code_document["attempts"] = 0
+    await mail_code_collection.replace_one({"user_id": user_id}, code_document, upsert=True)
     return confirmation_code
 
 
@@ -71,27 +75,45 @@ async def send_confirmation(request: Request, user: CurrentUser = Depends(get_cu
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-async def verify_confirmation_code(user: CurrentUser, provided_code: str) -> bool:
+async def verify_confirmation_code(user: CurrentUser, provided_code: str) -> dict | None:
     user_id = await get_user_id(user.username)
-    stored_code = await mail_code_collection.find_one({"user_id": user_id})
+    stored_code = await mail_code_collection.find_one({"user_id": user_id, "expires_at": {"$gt": _utcnow()}})
     if not stored_code:
-        raise HTTPException(status_code=404, detail="No code found for this user")
-    if stored_code["expires_at"] < _utcnow():
-        await mail_code_collection.delete_many({"user_id": user_id})
-        raise HTTPException(status_code=400, detail="Confirmation code expired")
-    return bcrypt.checkpw(provided_code.encode("utf-8"), stored_code["code"].encode("utf-8"))
+        return None
+    if not bcrypt.checkpw(provided_code.encode("utf-8"), stored_code["code"].encode("utf-8")):
+        updated = await mail_code_collection.find_one_and_update(
+            {"_id": stored_code["_id"]},
+            {"$inc": {"attempts": 1}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if updated and updated.get("attempts", 0) >= settings.confirmation_max_attempts:
+            await mail_code_collection.delete_one({"_id": stored_code["_id"]})
+        return None
+    return stored_code
 
 
 @router.post("/confirmation", status_code=status.HTTP_204_NO_CONTENT)
-async def confirmation(payload: ConfirmationRequest, user: CurrentUser = Depends(get_current_user_without_confirmation)):
-    confirmation = await verify_confirmation_code(user, payload.code)
-    if not confirmation:
+async def confirmation(
+    payload: ConfirmationRequest,
+    request: Request,
+    user: CurrentUser = Depends(get_current_user_without_confirmation),
+):
+    await enforce_rate_limit(request, f"confirm-code:{user.username}", settings.confirmation_rate_limit)
+    if user.is_active:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    confirmation_code = await verify_confirmation_code(user, payload.code)
+    if not confirmation_code:
         raise HTTPException(status_code=400, detail="Invalid code")
     user_id = await get_user_id(user.username)
-    await mail_code_collection.delete_many({"user_id": user_id})
-    result = await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": {"is_active": True}})
-    if result.modified_count == 0:
-        raise HTTPException(status_code=500, detail="Failed to activate user")
+    consumed = await mail_code_collection.find_one_and_delete({"_id": confirmation_code["_id"]})
+    if not consumed:
+        raise HTTPException(status_code=400, detail="Invalid or already used code")
+    result = await users_collection.update_one(
+        {"_id": parse_object_id(user_id, field="user identifier")},
+        {"$set": {"is_active": True}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -104,7 +126,7 @@ async def send_password_reset(request: Request, payload: PasswordResetRequest):
 
     now = _utcnow()
     token_payload = {
-        "sub": user.username,
+        "sub": str(user.id),
         "type": "password_reset",
         "iat": int(now.timestamp()),
         "nbf": int(now.timestamp()),
@@ -130,7 +152,8 @@ async def send_password_reset(request: Request, payload: PasswordResetRequest):
 
 
 @router.post("/password-change", status_code=status.HTTP_204_NO_CONTENT)
-async def password_change(payload: PasswordResetConfirm):
+async def password_change(payload: PasswordResetConfirm, request: Request):
+    await enforce_rate_limit(request, "password-change", settings.reset_rate_limit)
     try:
         decoded_payload = jwt.decode(payload.token, SECRET_KEY, algorithms=[ALGORITHM], issuer=settings.app_name)
     except jwt.PyJWTError as exc:
@@ -140,13 +163,37 @@ async def password_change(payload: PasswordResetConfirm):
         raise HTTPException(status_code=401, detail="Invalid token type")
 
     token_hash = hashlib.sha256(payload.token.encode("utf-8")).hexdigest()
-    reset_doc = await password_reset_collection.find_one({"token_hash": token_hash, "used": False})
+    subject = decoded_payload.get("sub")
+    if not subject:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+    if ObjectId.is_valid(subject):
+        user_object_id = ObjectId(subject)
+        user = await users_collection.find_one({"_id": user_object_id}, {"username": 1})
+    else:
+        user = await users_collection.find_one({"username": subject}, {"username": 1})
+        user_object_id = user["_id"] if user else None
+    if not user or user_object_id is None:
+        raise HTTPException(status_code=401, detail="Invalid reset token subject")
+    user_id = str(user_object_id)
+    now = _utcnow()
+    reset_doc = await password_reset_collection.find_one_and_update(
+        {
+            "token_hash": token_hash,
+            "user_id": user_id,
+            "used": False,
+            "expires_at": {"$gt": now},
+        },
+        {"$set": {"used": True, "used_at": now}},
+        return_document=ReturnDocument.AFTER,
+    )
     if not reset_doc:
         raise HTTPException(status_code=401, detail="Reset token not found or already used")
 
-    await users_collection.update_one(
-        {"username": decoded_payload["sub"]},
+    result = await users_collection.update_one(
+        {"_id": user_object_id},
         {"$set": {"password": hash_password(payload.new_password)}},
     )
-    await password_reset_collection.update_one({"_id": reset_doc["_id"]}, {"$set": {"used": True, "used_at": _utcnow()}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=401, detail="Invalid reset token subject")
+    await revoke_all_refresh_tokens(user_id, user.get("username"))
     return Response(status_code=status.HTTP_204_NO_CONTENT)

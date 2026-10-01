@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import difflib
+import logging
+import re
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from config.db import post_collection, users_collection
 from config.security import get_current_user, get_user_id
-from config.settings import settings
 from model.post_shemas import PostInDB
 from model.user_shemas import CurrentUser, UserInDB, UserSearch
+from services.storage import profile_media_url, with_post_media_urls
 
 try:
     from Levenshtein import distance as levenshtein_distance
@@ -19,6 +21,7 @@ except ModuleNotFoundError:
 
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _parse_csv(value: Optional[str]) -> list[str]:
@@ -27,27 +30,8 @@ def _parse_csv(value: Optional[str]) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def _profile_image_url(user_id: object) -> str:
-    from services.storage import resolve_profile_photo_path
-
-    normalized_user_id = str(user_id)
-    profile_path = resolve_profile_photo_path(normalized_user_id)
-    suffix = profile_path.suffix if profile_path else settings.default_profile_image.suffix.lower() or ".jpg"
-    return f"{settings.media_base_url.rstrip('/')}/{normalized_user_id}/photo_profile/photo_profile{suffix}"
-
-
 def _post_payload(post: dict) -> dict:
-    payload = dict(post)
-    post_id = str(payload.get("_id", ""))
-    user_id = str(payload.get("user_id", ""))
-    cover_format = payload.get("cover_format")
-    audio_format = payload.get("audio_format")
-    base_url = settings.media_base_url.rstrip("/")
-    if post_id and user_id and cover_format:
-        payload["cover_image_url"] = f"{base_url}/{user_id}/posts/{post_id}/caratula.{cover_format}"
-    if post_id and user_id and audio_format:
-        payload["audio_url"] = f"{base_url}/{user_id}/posts/{post_id}/audio.{audio_format}"
-    return payload
+    return with_post_media_urls(post)
 
 
 @router.get("/search_posts", response_model=List[PostInDB])
@@ -58,6 +42,8 @@ async def search_posts(
     bpm: Optional[int] = Query(None),
     search: Optional[str] = Query(None),
     query: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=100),
+    skip: int = Query(0, ge=0, le=10000),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     user_id = await get_user_id(current_user.username)
@@ -77,7 +63,7 @@ async def search_posts(
         mongo_query["instruments"] = {"$all": instrument_values}
 
     try:
-        results = await post_collection.find(mongo_query).to_list(length=None)
+        results = await post_collection.find(mongo_query).skip(skip).limit(limit).to_list(length=limit)
         term = (search or query or "").strip().lower()
 
         if term:
@@ -101,34 +87,42 @@ async def search_posts(
 
         return [PostInDB(**_post_payload(document)) for document in results]
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Database query failed: {exc}") from exc
+        logger.exception("Post search failed")
+        raise HTTPException(status_code=500, detail="Database query failed") from exc
 
 
 @router.get("/user/", response_model=List[UserInDB])
-async def search_user(params: UserSearch = Depends(), current_user: CurrentUser = Depends(get_current_user)):
+async def search_user(
+    params: UserSearch = Depends(),
+    limit: int = Query(50, ge=1, le=100),
+    skip: int = Query(0, ge=0, le=10000),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    escaped_username = re.escape(params.username)
     query = {
         "$and": [
             {"username": {"$ne": current_user.username}},
             {
                 "$or": [
-                    {"username": {"$regex": f"^{params.username}", "$options": "i"}},
-                    {"full_name": {"$regex": f"^{params.username}", "$options": "i"}} if params.username else {},
+                    {"username": {"$regex": f"^{escaped_username}", "$options": "i"}},
+                    {"full_name": {"$regex": f"^{escaped_username}", "$options": "i"}} if escaped_username else {},
                 ]
             },
         ]
     }
 
     try:
-        cursor = users_collection.find(query).sort("username")
-        results = await cursor.to_list(length=None)
+        cursor = users_collection.find(query).sort("username").skip(skip).limit(limit)
+        results = await cursor.to_list(length=limit)
         users = [
-            UserInDB(**{**doc, "profile_image_url": _profile_image_url(doc.get("_id"))})
+            UserInDB(**{**doc, "profile_image_url": profile_media_url(doc)})
             for doc in results
             if "username" in doc
         ]
         return sort_users_by_similarity(params.username, users)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Database query failed: {exc}") from exc
+        logger.exception("User search failed")
+        raise HTTPException(status_code=500, detail="Database query failed") from exc
 
 
 def sort_users_by_similarity(target: str, users: List[UserInDB]) -> List[UserInDB]:

@@ -1,7 +1,7 @@
 from typing import Optional
 
 from bson import ObjectId
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 class NewLyrics(BaseModel):
     title: str = Field(alias="title")
@@ -14,6 +14,7 @@ class Lyrics(NewLyrics):
 class LyricsInDB(Lyrics):
     id: str = Field(default=None,alias='_id')
 
-    @validator('id', pre=True, always=True)
+    @field_validator('id', mode='before')
+    @classmethod
     def convert_id(cls, v):
         return str(v) if isinstance(v, ObjectId) else v

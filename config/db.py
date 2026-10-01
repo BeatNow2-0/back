@@ -19,7 +19,7 @@ try:
     _mongo_uri = settings.resolved_mongo_uri
 except RuntimeError as exc:
     DATABASE_CONFIGURATION_ERROR = str(exc)
-    logger.error("MongoDB configuration error: %s", exc)
+    logger.error("MongoDB configuration is invalid")
     _mongo_uri = f"mongodb://localhost:27017/{settings.mongo_db}"
 
 try:
@@ -31,7 +31,7 @@ try:
     )
 except Exception as exc:
     DATABASE_CONFIGURATION_ERROR = str(exc)
-    logger.error("MongoDB client initialization failed: %s", exc)
+    logger.error("MongoDB client initialization failed")
     mongo_client = AsyncIOMotorClient(
         f"mongodb://localhost:27017/{settings.mongo_db}",
         serverSelectionTimeoutMS=5000,
@@ -60,18 +60,27 @@ async def get_database() -> Database:
 
 async def handle_database_error(request: Request, exc: PyMongoError):
     logger.exception("Database error on %s", request.url.path)
-    return JSONResponse(status_code=500, content={"detail": "Database error"})
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Database error",
+            "error": "database_error",
+            "message": "Database operation failed",
+            "details": {},
+            "request_id": getattr(request.state, "request_id", ""),
+        },
+    )
 
 
 async def ping_database() -> bool:
     if DATABASE_CONFIGURATION_ERROR:
-        logger.warning("Skipping MongoDB ping because configuration is invalid: %s", DATABASE_CONFIGURATION_ERROR)
+        logger.warning("Skipping MongoDB ping because configuration is invalid")
         return False
     try:
         await asyncio.wait_for(mongo_client.admin.command("ping"), timeout=5)
         return True
-    except Exception as exc:
-        logger.warning("MongoDB ping failed during startup: %s", exc)
+    except Exception:
+        logger.warning("MongoDB ping failed during startup")
         return False
 
 
@@ -86,13 +95,15 @@ async def ensure_indexes() -> bool:
         await asyncio.wait_for(follows_collection.create_index([("user_id_following", 1), ("user_id_followed", 1)], unique=True), timeout=5)
         await asyncio.wait_for(lyrics_collection.create_index("user_id"), timeout=5)
         await asyncio.wait_for(mail_code_collection.create_index("user_id", unique=True), timeout=5)
+        await asyncio.wait_for(mail_code_collection.create_index("expires_at", expireAfterSeconds=0), timeout=5)
         await asyncio.wait_for(password_reset_collection.create_index("token_hash", unique=True), timeout=5)
         await asyncio.wait_for(password_reset_collection.create_index("expires_at", expireAfterSeconds=0), timeout=5)
         await asyncio.wait_for(refresh_tokens_collection.create_index("jti", unique=True), timeout=5)
+        await asyncio.wait_for(refresh_tokens_collection.create_index("user_id"), timeout=5)
         await asyncio.wait_for(refresh_tokens_collection.create_index("expires_at", expireAfterSeconds=0), timeout=5)
         return True
-    except Exception as exc:
-        logger.warning("MongoDB index bootstrap failed: %s", exc)
+    except Exception:
+        logger.warning("MongoDB index bootstrap failed")
         return False
 
 

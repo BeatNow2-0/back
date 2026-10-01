@@ -28,4 +28,4 @@ async def send_email(email_receiver: str, subject: str, body: str) -> None:
     with smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, context=context) as smtp:
         smtp.login(settings.smtp_username, settings.smtp_password)
         smtp.send_message(message)
-    logger.info("Email sent", extra={"recipient": email_receiver, "subject": subject})
+    logger.info("Email sent")

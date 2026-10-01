@@ -15,8 +15,8 @@ Lanzar BeatNow como producto usable con:
 
 - `MongoDB Atlas` para base de datos.
 - `1 VPS Ubuntu` para API FastAPI + Nginx + systemd.
-- `1 bucket/object storage + CDN` para media.
-  Actualmente la app asume `https://res.beatnow.app/beatnow`.
+- `LocalStorageProvider` sobre `/srv/beatnow/media` para la beta, servido por Nginx en `https://res.beatnow.app`.
+  La interfaz permite migrar más adelante a object storage sin cambiar routers.
 - `1 hosting estático` para `web` y `app-web`.
   Recomendado: Vercel o Netlify.
 - `SMTP transaccional` para confirmación y reset de contraseña.
@@ -128,11 +128,13 @@ Validar producto con 10-30 productores y 30-100 artistas.
 
 ### Media
 
-Idealmente mover media a object storage y servir por CDN. Si no:
+Para la beta técnica:
 
-- montar volumen persistente en `/var/lib/beatnow/media`
+- mantener el volumen persistente en `/srv/beatnow/media`
 - backups diarios
 - vigilancia de espacio en disco
+
+La migración a object storage/CDN queda fuera de esta fase.
 
 ### CI/CD
 

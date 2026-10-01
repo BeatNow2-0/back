@@ -1,144 +1,353 @@
 from __future__ import annotations
 
+import os
 import shutil
-from pathlib import Path
+import tempfile
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+from typing import BinaryIO
+from uuid import uuid4
 
-from fastapi import HTTPException, UploadFile, status
+from fastapi import UploadFile
 
 from config.settings import settings
-
-ALLOWED_IMAGE_CONTENT_TYPES = {
-    "image/jpeg": ".jpg",
-    "image/png": ".png",
-    "image/gif": ".gif",
-    "image/webp": ".webp",
-}
-ALLOWED_AUDIO_CONTENT_TYPES = {
-    "audio/mpeg": ".mp3",
-    "audio/wav": ".wav",
-    "audio/x-wav": ".wav",
-    "audio/mp4": ".m4a",
-    "audio/x-m4a": ".m4a",
-}
-MAX_IMAGE_SIZE = 5 * 1024 * 1024
-MAX_AUDIO_SIZE = 20 * 1024 * 1024
+from services.media_validation import validate_audio_upload, validate_image_upload
 
 
-def _safe_user_path(user_id: str) -> Path:
-    return settings.media_root / user_id
+class StorageError(RuntimeError):
+    pass
 
 
-def _replace_file(target: Path, source: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target)
+class StorageProvider(ABC):
+    @abstractmethod
+    def save(self, key: str, data: bytes) -> str: ...
+
+    @abstractmethod
+    def delete(self, key: str) -> None: ...
+
+    @abstractmethod
+    def delete_prefix(self, prefix: str) -> None: ...
+
+    @abstractmethod
+    def exists(self, key: str) -> bool: ...
+
+    @abstractmethod
+    def read(self, key: str) -> bytes: ...
+
+    @abstractmethod
+    def open(self, key: str, mode: str = "rb") -> BinaryIO: ...
+
+    @abstractmethod
+    def get_public_url(self, key: str) -> str: ...
+
+    @abstractmethod
+    def generate_key(self, namespace: str, entity_id: str, filename: str) -> str: ...
+
+    @abstractmethod
+    def replace_from_temp(self, temp_key: str, final_key: str) -> str | None: ...
+
+    @abstractmethod
+    def rollback_replace(self, final_key: str, backup_key: str | None) -> None: ...
+
+    @abstractmethod
+    def health_check(self) -> bool: ...
 
 
-def _remove_matching_files(directory: Path, pattern: str) -> None:
-    for existing in directory.glob(pattern):
-        existing.unlink(missing_ok=True)
+class LocalStorageProvider(StorageProvider):
+    def __init__(self, root: Path, base_url: str):
+        self.root = root
+        self.base_url = base_url.rstrip("/")
+
+    @staticmethod
+    def _normalize_key(key: str) -> str:
+        raw_key = key.replace("\\", "/")
+        normalized = str(PurePosixPath(raw_key))
+        path = PurePosixPath(normalized)
+        if (
+            not raw_key
+            or normalized in {"", "."}
+            or path.is_absolute()
+            or ".." in path.parts
+            or "\x00" in normalized
+        ):
+            raise StorageError("Invalid storage key")
+        return normalized
+
+    @staticmethod
+    def _safe_segment(value: str) -> str:
+        if not value or value in {".", ".."} or any(character in value for character in "/\\\x00"):
+            raise StorageError("Invalid storage key segment")
+        return value
+
+    def _path(self, key: str) -> Path:
+        normalized = self._normalize_key(key)
+        root = self.root.resolve()
+        candidate = (root / normalized).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise StorageError("Storage key escapes media root") from exc
+        return candidate
+
+    def save(self, key: str, data: bytes) -> str:
+        normalized = self._normalize_key(key)
+        target = self._path(normalized)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp_directory = self._path("temp")
+        temp_directory.mkdir(parents=True, exist_ok=True)
+        temporary_path = temp_directory / f"write-{uuid4().hex}.tmp"
+        try:
+            with temporary_path.open("wb") as output:
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary_path, target)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        return normalized
+
+    def delete(self, key: str) -> None:
+        path = self._path(key)
+        path.unlink(missing_ok=True)
+        parent = path.parent
+        root = self.root.resolve()
+        while parent != root and parent.name != "temp":
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
+    def delete_prefix(self, prefix: str) -> None:
+        path = self._path(prefix)
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+
+    def exists(self, key: str) -> bool:
+        return self._path(key).is_file()
+
+    def read(self, key: str) -> bytes:
+        return self._path(key).read_bytes()
+
+    def open(self, key: str, mode: str = "rb") -> BinaryIO:
+        if mode not in {"rb", "r"}:
+            raise StorageError("Storage files can only be opened for reading")
+        return self._path(key).open(mode)
+
+    def get_public_url(self, key: str) -> str:
+        return f"{self.base_url}/{self._normalize_key(key)}"
+
+    def generate_key(self, namespace: str, entity_id: str, filename: str) -> str:
+        return "/".join(
+            (
+                self._safe_segment(namespace),
+                self._safe_segment(entity_id),
+                self._safe_segment(filename),
+            )
+        )
+
+    def replace_from_temp(self, temp_key: str, final_key: str) -> str | None:
+        source = self._path(temp_key)
+        target = self._path(final_key)
+        if not source.is_file():
+            raise StorageError("Staged media does not exist")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        backup_key = None
+        if target.exists():
+            backup_key = f"temp/backups/{uuid4().hex}.bak"
+            backup = self._path(backup_key)
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(target, backup)
+        try:
+            os.replace(source, target)
+        except Exception:
+            if backup_key:
+                os.replace(self._path(backup_key), target)
+            raise
+        return backup_key
+
+    def rollback_replace(self, final_key: str, backup_key: str | None) -> None:
+        self.delete(final_key)
+        if backup_key and self.exists(backup_key):
+            target = self._path(final_key)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(self._path(backup_key), target)
+
+    def health_check(self) -> bool:
+        try:
+            temp_directory = self._path("temp")
+            temp_directory.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryFile(dir=temp_directory) as probe:
+                probe.write(b"ok")
+                probe.seek(0)
+                return probe.read() == b"ok"
+        except OSError:
+            return False
 
 
-def create_user_directories(user_id: str) -> Path:
-    base = _safe_user_path(user_id)
-    (base / "photo_profile").mkdir(parents=True, exist_ok=True)
-    (base / "posts").mkdir(parents=True, exist_ok=True)
-    if settings.default_profile_image.exists():
-        target = base / "photo_profile" / f"photo_profile{settings.default_profile_image.suffix.lower()}"
-        if not target.exists():
-            shutil.copy2(settings.default_profile_image, target)
-    return base
+def get_storage_provider() -> StorageProvider:
+    if settings.storage_provider == "local":
+        return LocalStorageProvider(settings.media_root, settings.media_base_url)
+    raise StorageError(f"Unsupported storage provider: {settings.storage_provider}")
 
 
-def resolve_profile_photo_path(user_id: str) -> Path | None:
-    profile_dir = _safe_user_path(user_id) / "photo_profile"
-    candidates = sorted(profile_dir.glob("photo_profile.*"))
-    return candidates[0] if candidates else None
+storage = get_storage_provider()
 
 
-def delete_user_directories(user_id: str) -> None:
-    base = _safe_user_path(user_id)
-    if base.exists():
-        shutil.rmtree(base)
+@dataclass(slots=True)
+class MediaReplacement:
+    final_key: str
+    temp_key: str
+    provider: StorageProvider
+    backup_key: str | None = None
+    applied: bool = False
+
+    def apply(self) -> None:
+        self.backup_key = self.provider.replace_from_temp(self.temp_key, self.final_key)
+        self.applied = True
+
+    def rollback(self) -> None:
+        if self.applied:
+            self.provider.rollback_replace(self.final_key, self.backup_key)
+            self.applied = False
+            self.backup_key = None
+        else:
+            self.provider.delete(self.temp_key)
+
+    def finalize(self) -> None:
+        self.provider.delete(self.temp_key)
+        if self.backup_key:
+            self.provider.delete(self.backup_key)
 
 
-async def _validate_upload(upload: UploadFile, allowed: dict[str, str], max_bytes: int, label: str) -> str:
-    if upload.content_type not in allowed:
-        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=f"Unsupported {label} content type")
-    contents = await upload.read(max_bytes + 1)
-    if len(contents) > max_bytes:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"{label.capitalize()} too large")
-    await upload.seek(0)
-    return allowed[upload.content_type]
+@dataclass(slots=True)
+class MediaBatch:
+    replacements: list[MediaReplacement]
+    database_fields: dict[str, str]
+    old_keys: set[str] = field(default_factory=set)
+
+    def apply(self) -> None:
+        applied: list[MediaReplacement] = []
+        try:
+            for replacement in self.replacements:
+                replacement.apply()
+                applied.append(replacement)
+        except Exception:
+            for replacement in reversed(applied):
+                replacement.rollback()
+            for replacement in self.replacements[len(applied):]:
+                replacement.rollback()
+            raise
+
+    def rollback(self) -> None:
+        for replacement in reversed(self.replacements):
+            replacement.rollback()
+
+    def finalize(self) -> None:
+        final_keys = {replacement.final_key for replacement in self.replacements}
+        for replacement in self.replacements:
+            replacement.finalize()
+        for old_key in self.old_keys - final_keys:
+            self.replacements[0].provider.delete(old_key)
 
 
-async def save_post_files(user_id: str, post_id: str, cover_file: UploadFile, audio_file: UploadFile) -> tuple[str, str]:
-    image_suffix = await _validate_upload(cover_file, ALLOWED_IMAGE_CONTENT_TYPES, MAX_IMAGE_SIZE, "image")
-    audio_suffix = await _validate_upload(audio_file, ALLOWED_AUDIO_CONTENT_TYPES, MAX_AUDIO_SIZE, "audio")
-
-    post_dir = _safe_user_path(user_id) / "posts" / post_id
-    post_dir.mkdir(parents=True, exist_ok=True)
-
-    cover_path = post_dir / f"cover{image_suffix}"
-    legacy_cover_path = post_dir / f"caratula{image_suffix}"
-    audio_path = post_dir / f"audio{audio_suffix}"
-
-    with cover_path.open("wb") as image_buffer:
-        shutil.copyfileobj(cover_file.file, image_buffer)
-    _replace_file(legacy_cover_path, cover_path)
-    with audio_path.open("wb") as audio_buffer:
-        shutil.copyfileobj(audio_file.file, audio_buffer)
-
-    return image_suffix.lstrip("."), audio_suffix.lstrip(".")
+def _stage(data: bytes, extension: str, provider: StorageProvider = storage) -> str:
+    temp_key = f"temp/{uuid4().hex}.{extension}"
+    provider.save(temp_key, data)
+    return temp_key
 
 
-async def update_post_files(user_id: str, post_id: str, cover_file: UploadFile | None, audio_file: UploadFile | None) -> dict[str, str]:
-    post_dir = _safe_user_path(user_id) / "posts" / post_id
-    post_dir.mkdir(parents=True, exist_ok=True)
-    updated: dict[str, str] = {}
+async def prepare_avatar(
+    user_id: str,
+    upload: UploadFile,
+    old_key: str | None = None,
+    provider: StorageProvider = storage,
+) -> MediaBatch:
+    image = await validate_image_upload(upload)
+    final_key = provider.generate_key("avatars", user_id, "avatar.webp")
+    replacement = MediaReplacement(final_key, _stage(image.data, image.extension, provider), provider)
+    return MediaBatch(
+        [replacement],
+        {"avatar_key": final_key},
+        {old_key} if old_key else set(),
+    )
 
-    if cover_file is not None:
-        image_suffix = await _validate_upload(cover_file, ALLOWED_IMAGE_CONTENT_TYPES, MAX_IMAGE_SIZE, "image")
-        _remove_matching_files(post_dir, "cover.*")
-        _remove_matching_files(post_dir, "caratula.*")
-        cover_path = post_dir / f"cover{image_suffix}"
-        with cover_path.open("wb") as buffer:
-            shutil.copyfileobj(cover_file.file, buffer)
-        _replace_file(post_dir / f"caratula{image_suffix}", cover_path)
-        updated["cover_format"] = image_suffix.lstrip(".")
 
-    if audio_file is not None:
-        audio_suffix = await _validate_upload(audio_file, ALLOWED_AUDIO_CONTENT_TYPES, MAX_AUDIO_SIZE, "audio")
-        _remove_matching_files(post_dir, "audio.*")
-        with (post_dir / f"audio{audio_suffix}").open("wb") as buffer:
-            shutil.copyfileobj(audio_file.file, buffer)
-        updated["audio_format"] = audio_suffix.lstrip(".")
+async def prepare_beat_media(
+    post_id: str,
+    cover_file: UploadFile | None,
+    audio_file: UploadFile | None,
+    *,
+    old_cover_key: str | None = None,
+    old_audio_key: str | None = None,
+    provider: StorageProvider = storage,
+) -> MediaBatch:
+    cover = await validate_image_upload(cover_file) if cover_file is not None else None
+    audio = await validate_audio_upload(audio_file) if audio_file is not None else None
+    replacements: list[MediaReplacement] = []
+    fields: dict[str, str] = {}
 
-    return updated
+    if cover:
+        cover_key = provider.generate_key("beats", post_id, "cover.webp")
+        replacements.append(MediaReplacement(cover_key, _stage(cover.data, cover.extension, provider), provider))
+        fields.update({"cover_key": cover_key, "cover_format": "webp"})
+    if audio:
+        audio_key = provider.generate_key("beats", post_id, f"audio.{audio.extension}")
+        replacements.append(MediaReplacement(audio_key, _stage(audio.data, audio.extension, provider), provider))
+        fields.update({"audio_key": audio_key, "audio_format": audio.extension})
+
+    old_keys = set()
+    if cover and old_cover_key:
+        old_keys.add(old_cover_key)
+    if audio and old_audio_key:
+        old_keys.add(old_audio_key)
+    return MediaBatch(replacements, fields, old_keys)
+
+
+def create_user_directories(user_id: str) -> str:
+    return f"avatars/{user_id}"
+
+
+def delete_user_directories(user_id: str, post_ids: list[str] | None = None) -> None:
+    storage.delete_prefix(f"avatars/{user_id}")
+    for post_id in post_ids or []:
+        storage.delete_prefix(f"beats/{post_id}")
 
 
 def delete_post_directory(user_id: str, post_id: str) -> None:
-    post_dir = _safe_user_path(user_id) / "posts" / post_id
-    if post_dir.exists():
-        shutil.rmtree(post_dir)
+    storage.delete_prefix(f"beats/{post_id}")
 
 
-async def save_profile_photo(user_id: str, upload: UploadFile) -> str:
-    image_suffix = await _validate_upload(upload, ALLOWED_IMAGE_CONTENT_TYPES, MAX_IMAGE_SIZE, "image")
-    profile_dir = _safe_user_path(user_id) / "photo_profile"
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    _remove_matching_files(profile_dir, "photo_profile.*")
-
-    profile_path = profile_dir / f"photo_profile{image_suffix}"
-    with profile_path.open("wb") as buffer:
-        shutil.copyfileobj(upload.file, buffer)
-
-    return image_suffix.lstrip(".")
+def media_url(key: str | None) -> str | None:
+    return storage.get_public_url(key) if key else None
 
 
-def reset_profile_photo(user_id: str) -> None:
-    profile_dir = _safe_user_path(user_id) / "photo_profile"
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    _remove_matching_files(profile_dir, "photo_profile.*")
-    if settings.default_profile_image.exists():
-        target = profile_dir / f"photo_profile{settings.default_profile_image.suffix.lower()}"
-        shutil.copy2(settings.default_profile_image, target)
+def profile_media_url(user: dict) -> str | None:
+    avatar_key = user.get("avatar_key")
+    return media_url(str(avatar_key)) if avatar_key else None
+
+
+def with_post_media_urls(post: dict) -> dict:
+    payload = dict(post)
+    post_id = str(payload.get("_id", ""))
+    cover_key = payload.get("cover_key")
+    audio_key = payload.get("audio_key")
+    if post_id and not cover_key and payload.get("cover_format") not in {None, "pending"}:
+        cover_key = storage.generate_key("beats", post_id, f"cover.{payload['cover_format']}")
+    if post_id and not audio_key and payload.get("audio_format") not in {None, "pending"}:
+        audio_key = storage.generate_key("beats", post_id, f"audio.{payload['audio_format']}")
+    cover_url = media_url(cover_key)
+    audio_url = media_url(audio_key)
+    payload["cover_key"] = cover_key
+    payload["audio_key"] = audio_key
+    payload["cover_image_url"] = cover_url
+    payload["caratula"] = cover_url
+    payload["audio_url"] = audio_url
+    return payload
+
+
+def storage_ready() -> bool:
+    return storage.health_check()
