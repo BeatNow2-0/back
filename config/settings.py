@@ -41,6 +41,7 @@ class Settings:
     refresh_token_expire_minutes: int = int(os.getenv("REFRESH_TOKEN_EXPIRE_MINUTES", str(60 * 24 * 7)))
     password_reset_expire_minutes: int = int(os.getenv("PASSWORD_RESET_EXPIRE_MINUTES", "30"))
     confirmation_code_expire_minutes: int = int(os.getenv("CONFIRMATION_CODE_EXPIRE_MINUTES", "10"))
+    email_verification_token_expire_minutes: int = int(os.getenv("EMAIL_VERIFICATION_TOKEN_EXPIRE_MINUTES", "10"))
 
     mongo_user: str = os.getenv("MONGO_USER", "")
     mongo_password: str = os.getenv("MONGO_PASSWORD", "")
@@ -70,6 +71,7 @@ class Settings:
     reset_rate_limit: int = int(os.getenv("RESET_RATE_LIMIT", "3"))
     confirmation_rate_limit: int = int(os.getenv("CONFIRMATION_RATE_LIMIT", "5"))
     confirmation_max_attempts: int = int(os.getenv("CONFIRMATION_MAX_ATTEMPTS", "5"))
+    confirmation_resend_cooldown_seconds: int = int(os.getenv("CONFIRMATION_RESEND_COOLDOWN_SECONDS", "60"))
     trusted_proxy_ips: List[str] = None  # type: ignore[assignment]
 
     prometheus_enabled: bool = os.getenv("PROMETHEUS_ENABLED", "false").lower() == "true"

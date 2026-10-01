@@ -17,7 +17,7 @@ from config.security import (
     PASSWORD_RESET_EXPIRE_MINUTES,
     SECRET_KEY,
     generate_numeric_code,
-    get_current_user_without_confirmation,
+    get_current_user_for_email_verification,
     get_user_by_email,
     get_user_id,
     hash_password,
@@ -27,7 +27,14 @@ from config.settings import settings
 from core.rate_limit import enforce_rate_limit
 from core.mongo import parse_object_id
 from model.shemas import MailCode
-from model.user_shemas import ConfirmationRequest, CurrentUser, PasswordResetConfirm, PasswordResetRequest
+from model.user_shemas import (
+    ConfirmationRequest,
+    ConfirmationSentResponse,
+    CurrentUser,
+    PasswordResetConfirm,
+    PasswordResetRequest,
+    RetryAfterErrorResponse,
+)
 
 router = APIRouter()
 
@@ -51,7 +58,7 @@ async def create_and_save_confirmation_code(user: CurrentUser) -> str:
     return confirmation_code
 
 
-async def send_confirmation_email_to_user(user: CurrentUser) -> None:
+async def send_confirmation_email_to_user(user: CurrentUser, *, update_last_sent: bool = True) -> None:
     confirmation_code = await create_and_save_confirmation_code(user)
     subject = "Confirmacion de Registro"
     html_content = f"""
@@ -64,15 +71,67 @@ async def send_confirmation_email_to_user(user: CurrentUser) -> None:
     </body></html>
     """
     await send_email(user.email, subject, html_content)
+    if update_last_sent:
+        await users_collection.update_one(
+            {"_id": parse_object_id(str(user.id), field="user identifier")},
+            {"$set": {"confirmation_last_sent_at": _utcnow()}},
+        )
 
 
-@router.post("/send-confirmation", status_code=status.HTTP_204_NO_CONTENT)
-async def send_confirmation(request: Request, user: CurrentUser = Depends(get_current_user_without_confirmation)):
+def _seconds_until_resend(last_sent_at: datetime) -> int:
+    if last_sent_at.tzinfo is None:
+        last_sent_at = last_sent_at.replace(tzinfo=timezone.utc)
+    elapsed = (_utcnow() - last_sent_at).total_seconds()
+    return max(0, int(settings.confirmation_resend_cooldown_seconds - elapsed + 0.999))
+
+
+async def reserve_confirmation_resend(user: CurrentUser) -> int:
+    user_id = parse_object_id(str(user.id), field="user identifier")
+    now = _utcnow()
+    cutoff = now - timedelta(seconds=settings.confirmation_resend_cooldown_seconds)
+    updated = await users_collection.find_one_and_update(
+        {
+            "_id": user_id,
+            "is_active": False,
+            "$or": [
+                {"confirmation_last_sent_at": {"$exists": False}},
+                {"confirmation_last_sent_at": {"$lte": cutoff}},
+            ],
+        },
+        {"$set": {"confirmation_last_sent_at": now}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated:
+        return settings.confirmation_resend_cooldown_seconds
+
+    current = await users_collection.find_one({"_id": user_id}, {"is_active": 1, "confirmation_last_sent_at": 1})
+    if not current:
+        raise HTTPException(status_code=401, detail="Invalid verification token subject")
+    if current.get("is_active"):
+        raise HTTPException(status_code=400, detail="User already confirmed")
+    last_sent_at = current.get("confirmation_last_sent_at")
+    retry_after = _seconds_until_resend(last_sent_at) if isinstance(last_sent_at, datetime) else settings.confirmation_resend_cooldown_seconds
+    raise HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail={
+            "detail": "Please wait before requesting another code",
+            "retry_after": retry_after,
+        },
+    )
+
+
+@router.post(
+    "/send-confirmation",
+    response_model=ConfirmationSentResponse,
+    responses={status.HTTP_429_TOO_MANY_REQUESTS: {"model": RetryAfterErrorResponse}},
+)
+async def send_confirmation(request: Request, user: CurrentUser = Depends(get_current_user_for_email_verification)):
     await enforce_rate_limit(request, f"confirm:{user.username}", settings.confirmation_rate_limit)
     if user.is_active:
         raise HTTPException(status_code=400, detail="User already confirmed")
-    await send_confirmation_email_to_user(user)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    retry_after = await reserve_confirmation_resend(user)
+    await send_confirmation_email_to_user(user, update_last_sent=False)
+    return ConfirmationSentResponse(retry_after=retry_after)
 
 
 async def verify_confirmation_code(user: CurrentUser, provided_code: str) -> dict | None:
@@ -96,11 +155,11 @@ async def verify_confirmation_code(user: CurrentUser, provided_code: str) -> dic
 async def confirmation(
     payload: ConfirmationRequest,
     request: Request,
-    user: CurrentUser = Depends(get_current_user_without_confirmation),
+    user: CurrentUser = Depends(get_current_user_for_email_verification),
 ):
     await enforce_rate_limit(request, f"confirm-code:{user.username}", settings.confirmation_rate_limit)
     if user.is_active:
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
+        raise HTTPException(status_code=400, detail="User already confirmed")
     confirmation_code = await verify_confirmation_code(user, payload.code)
     if not confirmation_code:
         raise HTTPException(status_code=400, detail="Invalid code")
@@ -110,7 +169,7 @@ async def confirmation(
         raise HTTPException(status_code=400, detail="Invalid or already used code")
     result = await users_collection.update_one(
         {"_id": parse_object_id(user_id, field="user identifier")},
-        {"$set": {"is_active": True}},
+        {"$set": {"is_active": True}, "$unset": {"confirmation_last_sent_at": ""}},
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="User not found")

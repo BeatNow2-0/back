@@ -32,8 +32,17 @@ def _error_code(status_code: int, message: str) -> str:
 
 
 async def http_exception_handler(request: Request, exc: HTTPException):
-    message = exc.detail if isinstance(exc.detail, str) else "Request failed"
     headers = exc.headers or {}
+    if isinstance(exc.detail, dict):
+        content = dict(exc.detail)
+        message = content.get("detail") if isinstance(content.get("detail"), str) else "Request failed"
+        content.setdefault("error", _error_code(exc.status_code, message))
+        content.setdefault("message", message)
+        content.setdefault("details", {})
+        content.setdefault("request_id", _request_id(request))
+        return JSONResponse(status_code=exc.status_code, headers=headers, content=content)
+
+    message = exc.detail if isinstance(exc.detail, str) else "Request failed"
     return JSONResponse(
         status_code=exc.status_code,
         headers=headers,

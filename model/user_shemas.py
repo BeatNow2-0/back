@@ -86,6 +86,33 @@ class LoginResponse(BaseModel):
     token_type: str = "bearer"
 
 
+class VerificationRequiredResponse(UserPublic):
+    message: str = "Verification required"
+    verification_required: bool = True
+    verification_token: str
+    expires_in: int
+    token_type: str = "bearer"
+
+
+class InactiveLoginResponse(BaseModel):
+    detail: str = "Account verification required"
+    code: str = "ACCOUNT_NOT_VERIFIED"
+    verification_required: bool = True
+    verification_token: str
+    expires_in: int
+    token_type: str = "bearer"
+
+
+class ConfirmationSentResponse(BaseModel):
+    message: str = "Confirmation code sent"
+    retry_after: int
+
+
+class RetryAfterErrorResponse(BaseModel):
+    detail: str
+    retry_after: int
+
+
 class RefreshTokenRequest(BaseModel):
     refresh_token: str
 

@@ -19,8 +19,10 @@ from config.db import (
     users_collection,
 )
 from config.security import (
-    authenticate_user,
+    authenticate_user_credentials,
     consume_refresh_token,
+    create_email_verification_token,
+    get_email_verification_expires_in,
     get_current_user,
     get_current_user_without_confirmation,
     get_user,
@@ -35,7 +37,17 @@ from core.rate_limit import enforce_rate_limit
 from core.mongo import parse_object_id
 from model.lyrics_shemas import LyricsInDB
 from model.post_shemas import PostInDB
-from model.user_shemas import CurrentUser, LoginResponse, RefreshTokenRequest, RegisterRequest, UserProfile, UserPublic, UserUpdate
+from model.user_shemas import (
+    CurrentUser,
+    InactiveLoginResponse,
+    LoginResponse,
+    RefreshTokenRequest,
+    RegisterRequest,
+    UserProfile,
+    UserPublic,
+    UserUpdate,
+    VerificationRequiredResponse,
+)
 from routes.mail_routes import send_confirmation_email_to_user
 from services.storage import (
     create_user_directories,
@@ -65,7 +77,7 @@ def _post_payload(post: dict) -> dict:
     return with_post_media_urls(post)
 
 
-@router.post("/register", response_model=UserPublic, status_code=status.HTTP_201_CREATED)
+@router.post("/register", response_model=VerificationRequiredResponse, status_code=status.HTTP_201_CREATED)
 async def register(user: RegisterRequest, request: Request):
     await enforce_rate_limit(request, f"register:{user.username}", settings.register_rate_limit)
     if await users_collection.find_one({"username": user.username}):
@@ -89,7 +101,11 @@ async def register(user: RegisterRequest, request: Request):
             await send_confirmation_email_to_user(current_user)
         except Exception:
             logger.exception("Failed to send confirmation email")
-    return UserPublic(**_user_public_payload(created))
+    return VerificationRequiredResponse(
+        **_user_public_payload(created),
+        verification_token=create_email_verification_token(user_id),
+        expires_in=get_email_verification_expires_in(),
+    )
 
 
 @router.delete("/delete", status_code=status.HTTP_204_NO_CONTENT)
@@ -256,10 +272,22 @@ async def update_users_me(
     return UserPublic(**_user_public_payload(updated_user))
 
 
-@router.post("/login", response_model=LoginResponse)
+@router.post(
+    "/login",
+    response_model=LoginResponse,
+    responses={status.HTTP_403_FORBIDDEN: {"model": InactiveLoginResponse}},
+)
 async def login_for_access_token(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
     await enforce_rate_limit(request, f"login:{form_data.username}", settings.login_rate_limit)
-    user = await authenticate_user(form_data.username, form_data.password)
+    user = await authenticate_user_credentials(form_data.username, form_data.password)
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=InactiveLoginResponse(
+                verification_token=create_email_verification_token(str(user.id)),
+                expires_in=get_email_verification_expires_in(),
+            ).model_dump(),
+        )
     access_token, refresh_token = await issue_token_pair(user)
     return LoginResponse(access_token=access_token, refresh_token=refresh_token)
 
