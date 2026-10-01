@@ -58,6 +58,7 @@ class Settings:
     email_sender: str = os.getenv("EMAIL_SENDER", "")
 
     public_base_url: str = os.getenv("PUBLIC_BASE_URL", "https://api.example.com")
+    app_web_base_url: str = os.getenv("APP_WEB_BASE_URL", os.getenv("PUBLIC_BASE_URL", "https://api.example.com"))
     media_base_url: str = os.getenv("MEDIA_BASE_URL", "https://res.beatnow.app")
     media_root: Path = Path(os.getenv("MEDIA_ROOT", "/srv/beatnow/media"))
     storage_provider: str = os.getenv("STORAGE_PROVIDER", "local")

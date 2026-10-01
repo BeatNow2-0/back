@@ -189,6 +189,7 @@ class CapturedMail(list):
     def __init__(self):
         super().__init__()
         self.reset_tokens: list[str] = []
+        self.reset_links: list[str] = []
 
 
 @pytest.fixture()
@@ -228,7 +229,9 @@ def verification_client(monkeypatch):
                 sent_codes.append(code)
                 break
         if "token=" in html:
-            sent_codes.reset_tokens.append(html.split("token=", 1)[1].split("'", 1)[0])
+            reset_link = html.split("<a href='", 1)[1].split("'", 1)[0]
+            sent_codes.reset_links.append(reset_link)
+            sent_codes.reset_tokens.append(reset_link.split("token=", 1)[1])
 
     monkeypatch.setattr(mail_routes, "send_email", capture_email)
     monkeypatch.setattr(users_routes, "send_confirmation_email_to_user", mail_routes.send_confirmation_email_to_user)
@@ -236,6 +239,8 @@ def verification_client(monkeypatch):
     monkeypatch.setattr(mail_routes.settings, "confirmation_max_attempts", 3)
     monkeypatch.setattr(security.settings, "confirmation_resend_cooldown_seconds", 60)
     monkeypatch.setattr(mail_routes.settings, "confirmation_resend_cooldown_seconds", 60)
+    monkeypatch.setattr(mail_routes.settings, "public_base_url", "https://api.beatnow.app")
+    monkeypatch.setattr(mail_routes.settings, "app_web_base_url", "https://app.beatnow.app")
 
     return TestClient(app), users, mail_codes, refresh_tokens, sent_codes
 
@@ -417,6 +422,7 @@ def test_password_reset_aliases_change_password_once(verification_client):
     reset_request = client.post("/v1/api/mail/forgot-password", json={"email": " RESET@example.com "})
     assert reset_request.status_code == 204
     assert sent_codes.reset_tokens
+    assert sent_codes.reset_links[-1].startswith("https://app.beatnow.app/reset-password?token=")
 
     old_login = login(client, username="reset_user")
     assert old_login.status_code == 200

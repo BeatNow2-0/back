@@ -203,7 +203,7 @@ async def _send_password_reset(request: Request, payload: PasswordResetRequest) 
             "used": False,
         }
     )
-    reset_link = f"{settings.public_base_url.rstrip('/')}/reset-password?token={token}"
+    reset_link = f"{settings.app_web_base_url.rstrip('/')}/reset-password?token={token}"
     html_content = f"<html><body><p>Hello {user.username},</p><p>Reset your password:</p><a href='{reset_link}'>{reset_link}</a><p>This link expires in {PASSWORD_RESET_EXPIRE_MINUTES} minutes.</p></body></html>"
     await send_email(user.email, "Password Reset", html_content)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
