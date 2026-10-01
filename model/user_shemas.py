@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Optional
 
 from bson import ObjectId
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
 class RegisterRequest(BaseModel):
@@ -14,6 +14,11 @@ class RegisterRequest(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, value):
+        return value.strip().lower() if isinstance(value, str) else value
+
 
 class NewUser(BaseModel):
     full_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
@@ -21,6 +26,11 @@ class NewUser(BaseModel):
     email: str = Field(min_length=5, max_length=254)
     password: str = Field(min_length=8, max_length=128)
     is_active: bool = False
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, value):
+        return value.strip().lower() if isinstance(value, str) else value
 
 
 class User(BaseModel):
@@ -120,10 +130,19 @@ class RefreshTokenRequest(BaseModel):
 class PasswordResetRequest(BaseModel):
     email: str = Field(min_length=5, max_length=254)
 
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, value):
+        return value.strip().lower() if isinstance(value, str) else value
+
 
 class PasswordResetConfirm(BaseModel):
     token: str
-    new_password: str = Field(min_length=8, max_length=128)
+    new_password: str = Field(
+        min_length=8,
+        max_length=128,
+        validation_alias=AliasChoices("new_password", "newPassword", "password"),
+    )
 
 
 class ConfirmationRequest(BaseModel):

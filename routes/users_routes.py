@@ -31,6 +31,7 @@ from config.security import (
     revoke_refresh_token_value,
     issue_token_pair,
     hash_password,
+    normalize_login_username,
 )
 from config.settings import settings
 from core.rate_limit import enforce_rate_limit
@@ -278,7 +279,7 @@ async def update_users_me(
     responses={status.HTTP_403_FORBIDDEN: {"model": InactiveLoginResponse}},
 )
 async def login_for_access_token(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
-    await enforce_rate_limit(request, f"login:{form_data.username}", settings.login_rate_limit)
+    await enforce_rate_limit(request, f"login:{normalize_login_username(form_data.username)}", settings.login_rate_limit)
     user = await authenticate_user_credentials(form_data.username, form_data.password)
     if not user.is_active:
         raise HTTPException(

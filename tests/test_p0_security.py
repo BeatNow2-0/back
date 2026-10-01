@@ -1,4 +1,5 @@
 import asyncio
+import re
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -87,7 +88,11 @@ class AuthenticationUsers:
         self.document = document
 
     async def find_one(self, query, projection=None):
-        return dict(self.document) if query.get("username") == self.document["username"] else None
+        username = query.get("username")
+        if isinstance(username, dict) and "$regex" in username:
+            flags = re.IGNORECASE if "i" in username.get("$options", "") else 0
+            return dict(self.document) if re.match(username["$regex"], self.document["username"], flags) else None
+        return dict(self.document) if username == self.document["username"] else None
 
 
 def test_login_authentication_success_wrong_password_and_inactive(monkeypatch):
@@ -99,7 +104,7 @@ def test_login_authentication_success_wrong_password_and_inactive(monkeypatch):
         "is_active": True,
     }
     monkeypatch.setattr(security, "users_collection", AuthenticationUsers(document))
-    user = asyncio.run(security.authenticate_user("beta_user", "correct-password"))
+    user = asyncio.run(security.authenticate_user("BETA_USER", "correct-password"))
     assert user.username == "beta_user"
 
     with pytest.raises(HTTPException) as wrong_password:

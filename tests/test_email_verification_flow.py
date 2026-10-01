@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -35,6 +36,10 @@ class FakeUsersCollection:
                     return False
                 if "$gt" in value and (current is None or current <= value["$gt"]):
                     return False
+                if "$regex" in value:
+                    flags = re.IGNORECASE if "i" in value.get("$options", "") else 0
+                    if current is None or not re.match(value["$regex"], current, flags):
+                        return False
                 continue
             if current != value:
                 return False
@@ -120,6 +125,36 @@ class FakeMailCodeCollection:
         return SimpleNamespace(deleted_count=0)
 
 
+class FakePasswordResetCollection:
+    def __init__(self):
+        self.documents: dict[str, dict] = {}
+
+    async def delete_many(self, query):
+        user_id = query.get("user_id")
+        deleted = 0
+        for token_hash, document in list(self.documents.items()):
+            if document.get("user_id") == user_id:
+                self.documents.pop(token_hash)
+                deleted += 1
+        return SimpleNamespace(deleted_count=deleted)
+
+    async def insert_one(self, document):
+        self.documents[document["token_hash"]] = deepcopy(document)
+        return SimpleNamespace(inserted_id=ObjectId())
+
+    async def find_one_and_update(self, query, update, return_document=None):
+        document = self.documents.get(query.get("token_hash"))
+        if not document:
+            return None
+        if document.get("user_id") != query.get("user_id") or document.get("used") != query.get("used"):
+            return None
+        expires_filter = query.get("expires_at", {})
+        if "$gt" in expires_filter and document["expires_at"] <= expires_filter["$gt"]:
+            return None
+        document.update(update.get("$set", {}))
+        return deepcopy(document)
+
+
 class FakeRefreshTokensCollection:
     def __init__(self):
         self.documents: dict[str, dict] = {}
@@ -150,13 +185,20 @@ class FakeRefreshTokensCollection:
         return previous
 
 
+class CapturedMail(list):
+    def __init__(self):
+        super().__init__()
+        self.reset_tokens: list[str] = []
+
+
 @pytest.fixture()
 def verification_client(monkeypatch):
     _BUCKETS.clear()
     users = FakeUsersCollection()
     mail_codes = FakeMailCodeCollection()
+    password_resets = FakePasswordResetCollection()
     refresh_tokens = FakeRefreshTokensCollection()
-    sent_codes = []
+    sent_codes = CapturedMail()
     generated_codes = iter(
         [
             "111111",
@@ -175,6 +217,7 @@ def verification_client(monkeypatch):
     monkeypatch.setattr(mail_routes, "users_collection", users)
     monkeypatch.setattr(security, "users_collection", users)
     monkeypatch.setattr(mail_routes, "mail_code_collection", mail_codes)
+    monkeypatch.setattr(mail_routes, "password_reset_collection", password_resets)
     monkeypatch.setattr(security, "refresh_tokens_collection", refresh_tokens)
     monkeypatch.setattr(users_routes, "create_user_directories", lambda _user_id: None)
     monkeypatch.setattr(mail_routes, "generate_numeric_code", lambda: next(generated_codes))
@@ -184,6 +227,8 @@ def verification_client(monkeypatch):
             if code in html:
                 sent_codes.append(code)
                 break
+        if "token=" in html:
+            sent_codes.reset_tokens.append(html.split("token=", 1)[1].split("'", 1)[0])
 
     monkeypatch.setattr(mail_routes, "send_email", capture_email)
     monkeypatch.setattr(users_routes, "send_confirmation_email_to_user", mail_routes.send_confirmation_email_to_user)
@@ -290,7 +335,7 @@ def test_inactive_login_returns_verification_state_and_wrong_password_does_not(v
     client, _users, _mail_codes, _refresh_tokens, _sent_codes = verification_client
     register(client)
 
-    inactive = login(client)
+    inactive = login(client, username="NEW_USER")
     assert inactive.status_code == 403
     body = inactive.json()
     assert body["detail"] == "Account verification required"
@@ -339,7 +384,7 @@ def test_active_user_cannot_start_confirmation_and_active_login_refresh_logout_w
     resend = client.post("/v1/api/mail/send-confirmation", headers={"Authorization": f"Bearer {token}"})
     assert resend.status_code == 400
 
-    active_login = login(client)
+    active_login = login(client, username="NEW_USER")
     assert active_login.status_code == 200
     tokens = active_login.json()
     assert tokens["access_token"]
@@ -355,6 +400,44 @@ def test_active_user_cannot_start_confirmation_and_active_login_refresh_logout_w
     assert logout.status_code == 204
     assert any(document.get("revoked") for document in refresh_tokens.documents.values())
     assert next(iter(users.documents.values()))["is_active"] is True
+
+
+def test_password_reset_aliases_change_password_once(verification_client):
+    client, users, _mail_codes, _refresh_tokens, sent_codes = verification_client
+    verification_token = register(client, username="reset_user", email="Reset@Example.com").json()["verification_token"]
+    confirmation = client.post(
+        "/v1/api/mail/confirmation",
+        json={"code": "111111"},
+        headers={"Authorization": f"Bearer {verification_token}"},
+    )
+    assert confirmation.status_code == 204
+    user = next(iter(users.documents.values()))
+    assert user["email"] == "reset@example.com"
+
+    reset_request = client.post("/v1/api/mail/forgot-password", json={"email": " RESET@example.com "})
+    assert reset_request.status_code == 204
+    assert sent_codes.reset_tokens
+
+    old_login = login(client, username="reset_user")
+    assert old_login.status_code == 200
+
+    token = sent_codes.reset_tokens[-1]
+    reset = client.post(
+        "/v1/api/mail/reset-password",
+        json={"token": token, "newPassword": "new-correct-password"},
+    )
+    assert reset.status_code == 204
+
+    reused = client.post(
+        "/v1/api/mail/password-change",
+        json={"token": token, "password": "another-password"},
+    )
+    assert reused.status_code == 401
+
+    stale_login = login(client, username="reset_user")
+    assert stale_login.status_code == 401
+    fresh_login = login(client, username="reset_user", password="new-correct-password")
+    assert fresh_login.status_code == 200
 
 
 def test_openapi_exposes_verification_contract(verification_client):

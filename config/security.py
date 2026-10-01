@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
@@ -41,8 +42,15 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
 
+def normalize_login_username(username: str) -> str:
+    return username.strip().lower()
+
+
 async def authenticate_user_credentials(username: str, password: str) -> CurrentUser:
-    user_dict = await users_collection.find_one({"username": username})
+    normalized_username = normalize_login_username(username)
+    user_dict = await users_collection.find_one(
+        {"username": {"$regex": f"^{re.escape(normalized_username)}$", "$options": "i"}}
+    )
     if not user_dict or not verify_password(password, user_dict.get("password", "")):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

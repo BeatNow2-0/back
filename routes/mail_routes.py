@@ -176,8 +176,7 @@ async def confirmation(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post("/send-password-reset", status_code=status.HTTP_204_NO_CONTENT)
-async def send_password_reset(request: Request, payload: PasswordResetRequest):
+async def _send_password_reset(request: Request, payload: PasswordResetRequest) -> Response:
     await enforce_rate_limit(request, f"reset:{payload.email}", settings.reset_rate_limit)
     user = await get_user_by_email(payload.email)
     if not user:
@@ -210,8 +209,13 @@ async def send_password_reset(request: Request, payload: PasswordResetRequest):
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post("/password-change", status_code=status.HTTP_204_NO_CONTENT)
-async def password_change(payload: PasswordResetConfirm, request: Request):
+@router.post("/send-password-reset", status_code=status.HTTP_204_NO_CONTENT)
+@router.post("/forgot-password", status_code=status.HTTP_204_NO_CONTENT)
+async def send_password_reset(request: Request, payload: PasswordResetRequest):
+    return await _send_password_reset(request, payload)
+
+
+async def _password_change(payload: PasswordResetConfirm, request: Request) -> Response:
     await enforce_rate_limit(request, "password-change", settings.reset_rate_limit)
     try:
         decoded_payload = jwt.decode(payload.token, SECRET_KEY, algorithms=[ALGORITHM], issuer=settings.app_name)
@@ -256,3 +260,9 @@ async def password_change(payload: PasswordResetConfirm, request: Request):
         raise HTTPException(status_code=401, detail="Invalid reset token subject")
     await revoke_all_refresh_tokens(user_id, user.get("username"))
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/password-change", status_code=status.HTTP_204_NO_CONTENT)
+@router.post("/reset-password", status_code=status.HTTP_204_NO_CONTENT)
+async def password_change(payload: PasswordResetConfirm, request: Request):
+    return await _password_change(payload, request)
