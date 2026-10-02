@@ -267,7 +267,7 @@ async def prepare_avatar(
     provider: StorageProvider = storage,
 ) -> MediaBatch:
     image = await validate_image_upload(upload)
-    final_key = provider.generate_key("avatars", user_id, "avatar.webp")
+    final_key = provider.generate_key("avatars", user_id, f"avatar-{uuid4().hex}.webp")
     replacement = MediaReplacement(final_key, _stage(image.data, image.extension, provider), provider)
     return MediaBatch(
         [replacement],

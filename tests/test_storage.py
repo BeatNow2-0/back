@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from services.storage import LocalStorageProvider, MediaBatch, MediaReplacement, StorageError, with_post_media_urls
+from services.storage import LocalStorageProvider, MediaBatch, MediaReplacement, StorageError, prepare_avatar, with_post_media_urls
 
 
 def _provider(tmp_path: Path) -> LocalStorageProvider:
@@ -98,3 +98,48 @@ def test_new_media_urls_use_resource_domain():
     assert payload["cover_image_url"] == "https://res.beatnow.app/beats/beat123/cover.webp"
     assert payload["caratula"] == payload["cover_image_url"]
     assert payload["audio_url"] == "https://res.beatnow.app/beats/beat123/audio.mp3"
+
+
+def test_prepare_avatar_generates_a_unique_versioned_key(tmp_path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    import services.storage as storage_module
+
+    provider = _provider(tmp_path)
+
+    async def valid_image(_upload):
+        return SimpleNamespace(data=b"webp-image", extension="webp")
+
+    monkeypatch.setattr(storage_module, "validate_image_upload", valid_image)
+    first = asyncio.run(prepare_avatar("user123", object(), provider=provider))
+    second = asyncio.run(prepare_avatar("user123", object(), provider=provider))
+
+    first_key = first.database_fields["avatar_key"]
+    second_key = second.database_fields["avatar_key"]
+    assert first_key.startswith("avatars/user123/avatar-") and first_key.endswith(".webp")
+    assert second_key != first_key
+    assert provider.exists(first.replacements[0].temp_key)
+    assert provider.exists(second.replacements[0].temp_key)
+
+
+def test_avatar_batch_removes_old_key_after_finalize_and_rolls_back_on_failure(tmp_path):
+    provider = _provider(tmp_path)
+    old_key = "avatars/user123/avatar-old.webp"
+    provider.save(old_key, b"old-avatar")
+    provider.save("temp/new-avatar.webp", b"new-avatar")
+    new_key = "avatars/user123/avatar-new.webp"
+    batch = MediaBatch([MediaReplacement(new_key, "temp/new-avatar.webp", provider)], {"avatar_key": new_key}, {old_key})
+
+    batch.apply()
+    batch.rollback()
+    assert provider.read(old_key) == b"old-avatar"
+    assert not provider.exists(new_key)
+    assert not provider.exists("temp/new-avatar.webp")
+
+    provider.save("temp/new-avatar.webp", b"new-avatar")
+    batch = MediaBatch([MediaReplacement(new_key, "temp/new-avatar.webp", provider)], {"avatar_key": new_key}, {old_key})
+    batch.apply()
+    batch.finalize()
+    assert not provider.exists(old_key)
+    assert provider.read(new_key) == b"new-avatar"
+    assert not provider.exists("temp/new-avatar.webp")

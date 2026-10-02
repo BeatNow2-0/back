@@ -70,7 +70,9 @@ def _profile_image_url(user: dict) -> str | None:
 
 def _user_public_payload(user: dict) -> dict:
     payload = dict(user)
-    payload["profile_image_url"] = _profile_image_url(user)
+    profile_url = _profile_image_url(user)
+    payload["profile_image_url"] = profile_url
+    payload["photo_profile"] = profile_url
     return payload
 
 
@@ -219,9 +221,12 @@ async def delete_photo_profile(current_user: Annotated[CurrentUser, Depends(get_
     user = await users_collection.find_one({"_id": user_object_id}, {"avatar_key": 1})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    await users_collection.update_one({"_id": user_object_id}, {"$unset": {"avatar_key": ""}})
-    avatar_key = user.get("avatar_key") or storage.generate_key("avatars", user_id, "avatar.webp")
-    storage.delete(avatar_key)
+    result = await users_collection.update_one({"_id": user_object_id}, {"$unset": {"avatar_key": ""}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    avatar_key = user.get("avatar_key")
+    if avatar_key:
+        storage.delete(avatar_key)
     return {
         "message": "Profile photo reset",
         "profile_image_url": None,

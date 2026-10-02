@@ -40,6 +40,7 @@ class User(BaseModel):
     is_active: bool
     bio: Optional[str] = Field(default=None, max_length=280)
     profile_image_url: Optional[str] = None
+    photo_profile: Optional[str] = None
 
 
 class CurrentUser(User):
