@@ -52,6 +52,7 @@ instruments_collection = db["Instruments"]
 mail_code_collection = db["MailCode"]
 password_reset_collection = db["PasswordReset"]
 refresh_tokens_collection = db["RefreshTokens"]
+beat_analyses_collection = db["BeatAnalyses"]
 
 
 async def get_database() -> Database:
@@ -101,6 +102,8 @@ async def ensure_indexes() -> bool:
         await asyncio.wait_for(refresh_tokens_collection.create_index("jti", unique=True), timeout=5)
         await asyncio.wait_for(refresh_tokens_collection.create_index("user_id"), timeout=5)
         await asyncio.wait_for(refresh_tokens_collection.create_index("expires_at", expireAfterSeconds=0), timeout=5)
+        await asyncio.wait_for(beat_analyses_collection.create_index([("user_id", 1), ("created_at", -1)]), timeout=5)
+        await asyncio.wait_for(beat_analyses_collection.create_index([("status", 1), ("expires_at", 1)]), timeout=5)
         return True
     except Exception:
         logger.warning("MongoDB index bootstrap failed")

@@ -25,6 +25,7 @@ from routes.posts_routes import router as posts_router
 from routes.routes import router as routes_router
 from routes.search_routes import router as search_router
 from routes.users_routes import router as users_router
+from routes.beat_analysis_routes import router as beat_analysis_router, publish_router as beat_publish_router
 from services.storage import StorageError, storage, storage_ready
 
 configure_logging()
@@ -82,6 +83,8 @@ app.include_router(search_router, prefix="/v1/api/search", tags=["search"])
 app.include_router(filter_router, prefix="/v1/api/filter", tags=["filter"])
 app.include_router(mail_router, prefix="/v1/api/mail", tags=["mail"])
 app.include_router(download_router, prefix="/v1/api/download", tags=["download"])
+app.include_router(beat_analysis_router, prefix="/api/v1/beat-analysis", tags=["beat-analysis"])
+app.include_router(beat_publish_router, prefix="/api/v1/beats", tags=["beats"])
 app.include_router(routes_router)
 
 

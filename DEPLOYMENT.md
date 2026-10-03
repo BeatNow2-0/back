@@ -137,11 +137,11 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/srv/beatnow/media
+ReadWritePaths=/srv/beatnow/media /srv/beatnow/.beat-analysis-tmp
 UMask=0027
 ```
 
-Con `ProtectSystem=strict`, `ReadWritePaths=/srv/beatnow/media` es obligatorio. Revisar con `systemd-analyze security beatnow.service` y probar uploads antes de mantener el cambio.
+Con `ProtectSystem=strict`, `ReadWritePaths` debe permitir `/srv/beatnow/media` y `/srv/beatnow/.beat-analysis-tmp` para que la API gestione los análisis privados. Revisar con `systemd-analyze security beatnow.service` y probar uploads antes de mantener el cambio.
 
 ## Backups
 

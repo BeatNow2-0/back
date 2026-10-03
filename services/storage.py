@@ -260,6 +260,17 @@ def _stage(data: bytes, extension: str, provider: StorageProvider = storage) -> 
     return temp_key
 
 
+def stage_file(source: str | Path, extension: str, provider: StorageProvider = storage) -> str:
+    """Copy a file into provider staging without reading it into memory."""
+    temp_key = f"temp/{uuid4().hex}.{extension}"
+    if not isinstance(provider, LocalStorageProvider):
+        raise StorageError("File staging is not supported by this storage provider")
+    target = provider._path(temp_key)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+    return temp_key
+
+
 async def prepare_avatar(
     user_id: str,
     upload: UploadFile,
