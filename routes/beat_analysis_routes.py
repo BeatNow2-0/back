@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -18,6 +19,7 @@ from services.beat_analysis.analyzer import analyze_beat
 from services.storage import MediaBatch, MediaReplacement, delete_post_directory, stage_file, storage, with_post_media_urls
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 ALLOWED = {"wav", "mp3", "flac", "m4a"}
 
 
@@ -69,7 +71,18 @@ async def create_analysis(file: UploadFile = File(...), current_user: CurrentUse
     except HTTPException:
         _remove({"_id": analysis_id})
         raise
+    except RuntimeError as exc:
+        if str(exc) in {"FFmpeg is required to analyze this audio", "FFprobe is required to validate audio duration"}:
+            logger.exception("Beat analysis dependency unavailable")
+            await beat_analyses_collection.update_one({"_id": analysis_id}, {"$set": {"status": "failed", "error": "Audio analysis is temporarily unavailable"}})
+            _remove({"_id": analysis_id})
+            raise HTTPException(503, "Audio analysis is temporarily unavailable") from exc
+        logger.exception("Beat analysis failed for upload %s", filename)
+        await beat_analyses_collection.update_one({"_id": analysis_id}, {"$set": {"status": "failed", "error": "Audio could not be analyzed"}})
+        _remove({"_id": analysis_id})
+        raise HTTPException(422, "Audio could not be analyzed") from exc
     except Exception as exc:
+        logger.exception("Beat analysis failed for upload %s", filename)
         await beat_analyses_collection.update_one({"_id": analysis_id}, {"$set": {"status": "failed", "error": "Audio could not be analyzed"}})
         _remove({"_id": analysis_id})
         raise HTTPException(422, "Audio could not be analyzed") from exc
