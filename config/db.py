@@ -53,6 +53,7 @@ mail_code_collection = db["MailCode"]
 password_reset_collection = db["PasswordReset"]
 refresh_tokens_collection = db["RefreshTokens"]
 beat_analyses_collection = db["BeatAnalyses"]
+copyright_reports_collection = db["CopyrightReports"]
 
 
 async def get_database() -> Database:
@@ -92,8 +93,16 @@ async def ensure_indexes() -> bool:
         await asyncio.wait_for(users_collection.create_index("username", unique=True), timeout=5)
         await asyncio.wait_for(users_collection.create_index("email", unique=True), timeout=5)
         await asyncio.wait_for(post_collection.create_index("user_id"), timeout=5)
+        await asyncio.wait_for(post_collection.create_index([("user_id", 1), ("publication_date", -1)]), timeout=5)
+        await asyncio.wait_for(post_collection.create_index("original_sha256"), timeout=5)
+        await asyncio.wait_for(post_collection.create_index([("user_id", 1), ("request_id", 1)], unique=True, sparse=True), timeout=5)
+        await asyncio.wait_for(post_collection.create_index([("visibility", 1), ("publication_date", -1), ("_id", -1)]), timeout=5)
+        await asyncio.wait_for(post_collection.create_index([("publication_status", 1), ("processing_status", 1), ("publication_date", -1)]), timeout=5)
         await asyncio.wait_for(interactions_collection.create_index([("user_id", 1), ("post_id", 1)], unique=True), timeout=5)
+        await asyncio.wait_for(interactions_collection.create_index([("user_id", 1), ("saved_date", -1)]), timeout=5)
+        await asyncio.wait_for(interactions_collection.create_index([("user_id", 1), ("like_date", -1)]), timeout=5)
         await asyncio.wait_for(follows_collection.create_index([("user_id_following", 1), ("user_id_followed", 1)], unique=True), timeout=5)
+        await asyncio.wait_for(follows_collection.create_index([("user_id_followed", 1), ("user_id_following", 1)]), timeout=5)
         await asyncio.wait_for(lyrics_collection.create_index("user_id"), timeout=5)
         await asyncio.wait_for(mail_code_collection.create_index("user_id", unique=True), timeout=5)
         await asyncio.wait_for(mail_code_collection.create_index("expires_at", expireAfterSeconds=0), timeout=5)
@@ -104,6 +113,8 @@ async def ensure_indexes() -> bool:
         await asyncio.wait_for(refresh_tokens_collection.create_index("expires_at", expireAfterSeconds=0), timeout=5)
         await asyncio.wait_for(beat_analyses_collection.create_index([("user_id", 1), ("created_at", -1)]), timeout=5)
         await asyncio.wait_for(beat_analyses_collection.create_index([("status", 1), ("expires_at", 1)]), timeout=5)
+        await asyncio.wait_for(copyright_reports_collection.create_index([("status", 1), ("created_at", -1)]), timeout=5)
+        await asyncio.wait_for(copyright_reports_collection.create_index([("beat_id", 1), ("created_at", -1)]), timeout=5)
         return True
     except Exception:
         logger.warning("MongoDB index bootstrap failed")

@@ -5,7 +5,7 @@ import logging
 from typing import Annotated, List
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
+from fastapi import APIRouter, Cookie, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.security import OAuth2PasswordRequestForm
 from pymongo.errors import DuplicateKeyError
 
@@ -48,6 +48,7 @@ from model.user_shemas import (
     UserPublic,
     UserUpdate,
     VerificationRequiredResponse,
+    WebLoginResponse,
 )
 from routes.mail_routes import send_confirmation_email_to_user
 from services.storage import (
@@ -80,6 +81,30 @@ def _post_payload(post: dict) -> dict:
     return with_post_media_urls(post)
 
 
+def _set_refresh_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key=settings.refresh_cookie_name,
+        value=token,
+        max_age=settings.refresh_token_expire_minutes * 60,
+        httponly=True,
+        secure=settings.environment == "production",
+        samesite="strict",
+        path="/v1/api/users/web",
+        domain=settings.refresh_cookie_domain,
+    )
+
+
+def _clear_refresh_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=settings.refresh_cookie_name,
+        path="/v1/api/users/web",
+        domain=settings.refresh_cookie_domain,
+        secure=settings.environment == "production",
+        httponly=True,
+        samesite="strict",
+    )
+
+
 @router.post("/register", response_model=VerificationRequiredResponse, status_code=status.HTTP_201_CREATED)
 async def register(user: RegisterRequest, request: Request):
     await enforce_rate_limit(request, f"register:{user.username}", settings.register_rate_limit)
@@ -91,6 +116,7 @@ async def register(user: RegisterRequest, request: Request):
     user_dict = user.model_dump()
     user_dict["password"] = hash_password(user.password)
     user_dict["is_active"] = False
+    user_dict["role"] = "artist"
     try:
         result = await users_collection.insert_one(user_dict)
     except DuplicateKeyError as exc:
@@ -114,20 +140,21 @@ async def register(user: RegisterRequest, request: Request):
 @router.delete("/delete", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_user(current_user: CurrentUser = Depends(get_current_user)):
     user_id = await get_user_id(current_user.username)
-    post_ids = []
-    async for post in post_collection.find({"user_id": user_id}, {"_id": 1}):
-        post_ids.append(post["_id"])
+    owned_posts = await post_collection.find({"user_id": user_id}, {"_id": 1, "master_key": 1, "original_storage_key": 1, "preview_key": 1}).to_list(length=100000)
+    post_ids = [post["_id"] for post in owned_posts]
+    original_keys = [post.get("master_key") or post.get("original_storage_key") for post in owned_posts if post.get("master_key") or post.get("original_storage_key")]
+    preview_keys = [post["preview_key"] for post in owned_posts if post.get("preview_key")]
 
     await follows_collection.delete_many({"user_id_following": user_id})
     await follows_collection.delete_many({"user_id_followed": user_id})
     await lyrics_collection.delete_many({"user_id": user_id})
     await interactions_collection.delete_many({"post_id": {"$in": [str(pid) for pid in post_ids]}})
     await interactions_collection.delete_many({"user_id": user_id})
+    delete_user_directories(user_id, [str(post_id) for post_id in post_ids], original_keys, preview_keys)
     await post_collection.delete_many({"user_id": user_id})
     await password_reset_collection.delete_many({"user_id": user_id})
     await revoke_all_refresh_tokens(user_id, current_user.username)
     await users_collection.delete_one({"_id": parse_object_id(user_id, field="user identifier")})
-    delete_user_directories(user_id, [str(post_id) for post_id in post_ids])
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -147,7 +174,9 @@ async def get_posts_by_username(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    posts = await post_collection.find({"user_id": str(user["_id"])}).sort("publication_date", -1).skip(skip).limit(limit).to_list(length=limit)
+    current_user_id = await get_user_id(current_user.username)
+    visibility_filter = {} if current_user_id == str(user["_id"]) else {"publication_status": "published", "processing_status": "ready", "preview_key": {"$exists": True, "$ne": None}, "visibility": {"$ne": "unpublished"}}
+    posts = await post_collection.find({"user_id": str(user["_id"]), **visibility_filter}).sort([("publication_date", -1), ("_id", -1)]).skip(skip).limit(limit).to_list(length=limit)
     return [PostInDB(**_post_payload(post)) for post in posts]
 
 
@@ -162,8 +191,11 @@ async def get_user_profile(
 
     followers = await follows_collection.count_documents({"user_id_followed": user_id})
     following = await follows_collection.count_documents({"user_id_following": user_id})
-    post_num = await post_collection.count_documents({"user_id": user_id})
     current_user_id = await get_user_id(current_user.username)
+    post_filter = {"user_id": user_id}
+    if current_user_id != user_id:
+        post_filter.update({"publication_status": "published", "processing_status": "ready", "preview_key": {"$exists": True, "$ne": None}, "visibility": {"$ne": "unpublished"}})
+    post_num = await post_collection.count_documents(post_filter)
     is_following_user = False
     if current_user_id != user_id:
         is_following_user = (
@@ -311,6 +343,60 @@ async def logout(payload: RefreshTokenRequest):
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@router.post(
+    "/web/login",
+    response_model=WebLoginResponse,
+    responses={status.HTTP_403_FORBIDDEN: {"model": InactiveLoginResponse}},
+)
+async def web_login(response: Response, request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
+    """Browser login: the rotatable refresh credential never enters JavaScript."""
+    await enforce_rate_limit(request, f"login:{normalize_login_username(form_data.username)}", settings.login_rate_limit)
+    user = await authenticate_user_credentials(form_data.username, form_data.password)
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=InactiveLoginResponse(
+                verification_token=create_email_verification_token(str(user.id)),
+                expires_in=get_email_verification_expires_in(),
+            ).model_dump(),
+        )
+    access_token, refresh_token = await issue_token_pair(user)
+    _set_refresh_cookie(response, refresh_token)
+    response.headers["Cache-Control"] = "no-store"
+    return WebLoginResponse(access_token=access_token)
+
+
+@router.post("/web/refresh", response_model=WebLoginResponse)
+async def web_refresh(
+    response: Response,
+    refresh_token: str | None = Cookie(default=None, alias=settings.refresh_cookie_name),
+):
+    if not refresh_token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session cookie missing")
+    user = await consume_refresh_token(refresh_token)
+    access_token, rotated_refresh_token = await issue_token_pair(user)
+    _set_refresh_cookie(response, rotated_refresh_token)
+    response.headers["Cache-Control"] = "no-store"
+    return WebLoginResponse(access_token=access_token)
+
+
+@router.post("/web/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def web_logout(
+    response: Response,
+    refresh_token: str | None = Cookie(default=None, alias=settings.refresh_cookie_name),
+):
+    if refresh_token:
+        try:
+            await revoke_refresh_token_value(refresh_token)
+        except HTTPException:
+            # Logout remains idempotent for expired, rotated or malformed cookies.
+            pass
+    _clear_refresh_cookie(response)
+    response.headers["Cache-Control"] = "no-store"
+    response.status_code = status.HTTP_204_NO_CONTENT
+    return response
+
+
 @router.get("/saved-posts")
 async def get_saved_posts(
     limit: int = Query(50, ge=1, le=100),
@@ -321,7 +407,7 @@ async def get_saved_posts(
     saved_posts = await interactions_collection.find({"user_id": user_id, "saved_date": {"$exists": True}}).sort("saved_date", -1).skip(skip).limit(limit).to_list(length=limit)
     valid_post_ids = [post["post_id"] for post in saved_posts if ObjectId.is_valid(post.get("post_id"))]
     object_ids = [parse_object_id(post_id, field="post identifier") for post_id in valid_post_ids]
-    original_posts = await post_collection.find({"_id": {"$in": object_ids}}).to_list(length=len(object_ids))
+    original_posts = await post_collection.find({"_id": {"$in": object_ids}, "publication_status": "published", "processing_status": "ready", "preview_key": {"$exists": True, "$ne": None}, "visibility": {"$ne": "unpublished"}}).to_list(length=len(object_ids))
     post_map = {str(post["_id"]): post for post in original_posts}
     owner_ids = {str(post.get("user_id")) for post in original_posts if post.get("user_id")}
     owners = await users_collection.find(

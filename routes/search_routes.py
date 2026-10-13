@@ -5,10 +5,12 @@ import logging
 import re
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from config.db import post_collection, users_collection
 from config.security import get_current_user, get_user_id
+from config.settings import settings
+from core.rate_limit import enforce_rate_limit
 from model.post_shemas import PostInDB
 from model.user_shemas import CurrentUser, UserInDB, UserSearch
 from services.storage import profile_media_url, with_post_media_urls
@@ -36,23 +38,43 @@ def _post_payload(post: dict) -> dict:
 
 @router.get("/search_posts", response_model=List[PostInDB])
 async def search_posts(
+    request: Request,
     genre: Optional[str] = Query(None),
     moods: Optional[str] = Query(None),
     instruments: Optional[str] = Query(None),
     bpm: Optional[int] = Query(None),
-    search: Optional[str] = Query(None),
-    query: Optional[str] = Query(None),
+    bpm_min: Optional[int] = Query(None, ge=1, le=400),
+    bpm_max: Optional[int] = Query(None, ge=1, le=400),
+    tags: Optional[str] = Query(None),
+    license_type: Optional[str] = Query(None, pattern="^(unavailable|free_noncommercial|contact)$"),
+    search: Optional[str] = Query(None, max_length=100),
+    query: Optional[str] = Query(None, max_length=100),
     limit: int = Query(50, ge=1, le=100),
     skip: int = Query(0, ge=0, le=10000),
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    user_id = await get_user_id(current_user.username)
-    mongo_query: dict[str, object] = {"user_id": {"$ne": user_id}}
+    await enforce_rate_limit(request, "search-posts", settings.search_rate_limit)
+    await get_user_id(current_user.username)
+    mongo_query: dict[str, object] = {
+        "publication_status": "published",
+        "processing_status": "ready",
+        "preview_key": {"$exists": True, "$ne": None},
+        "visibility": {"$ne": "unpublished"},
+    }
 
     if genre:
         mongo_query["genre"] = genre
     if bpm is not None:
         mongo_query["bpm"] = bpm
+    elif bpm_min is not None or bpm_max is not None:
+        bpm_range: dict[str, int] = {}
+        if bpm_min is not None:
+            bpm_range["$gte"] = bpm_min
+        if bpm_max is not None:
+            bpm_range["$lte"] = bpm_max
+        if bpm_min is not None and bpm_max is not None and bpm_min > bpm_max:
+            raise HTTPException(status_code=422, detail="Minimum BPM cannot exceed maximum BPM")
+        mongo_query["bpm"] = bpm_range
 
     mood_values = _parse_csv(moods)
     if mood_values:
@@ -62,28 +84,23 @@ async def search_posts(
     if instrument_values:
         mongo_query["instruments"] = {"$all": instrument_values}
 
+    tag_values = _parse_csv(tags)
+    if tag_values:
+        mongo_query["tags"] = {"$all": tag_values}
+    if license_type:
+        mongo_query["license_type"] = license_type
+
+    term = (search or query or "").strip()
+    if term:
+        escaped = re.escape(term)
+        mongo_query["$or"] = [
+            {"title": {"$regex": escaped, "$options": "i"}},
+            {"description": {"$regex": escaped, "$options": "i"}},
+            {"tags": {"$regex": escaped, "$options": "i"}},
+        ]
+
     try:
-        results = await post_collection.find(mongo_query).skip(skip).limit(limit).to_list(length=limit)
-        term = (search or query or "").strip().lower()
-
-        if term:
-            def similarity_score(post: dict) -> tuple[float, float, float]:
-                title_similarity = difflib.SequenceMatcher(None, term, str(post.get("title", "")).lower()).ratio()
-                tags_similarity = max(
-                    (
-                        difflib.SequenceMatcher(None, term, str(tag).lower()).ratio()
-                        for tag in post.get("tags", [])
-                    ),
-                    default=0,
-                )
-                description_similarity = difflib.SequenceMatcher(
-                    None,
-                    term,
-                    str(post.get("description", "")).lower(),
-                ).ratio()
-                return (title_similarity, tags_similarity, description_similarity)
-
-            results = sorted(results, key=similarity_score, reverse=True)
+        results = await post_collection.find(mongo_query).sort([("publication_date", -1), ("_id", -1)]).skip(skip).limit(limit).to_list(length=limit)
 
         return [PostInDB(**_post_payload(document)) for document in results]
     except Exception as exc:
@@ -93,15 +110,18 @@ async def search_posts(
 
 @router.get("/user/", response_model=List[UserInDB])
 async def search_user(
+    request: Request,
     params: UserSearch = Depends(),
     limit: int = Query(50, ge=1, le=100),
     skip: int = Query(0, ge=0, le=10000),
     current_user: CurrentUser = Depends(get_current_user),
 ):
+    await enforce_rate_limit(request, "search-users", settings.search_rate_limit)
     escaped_username = re.escape(params.username)
     query = {
         "$and": [
             {"username": {"$ne": current_user.username}},
+            {"is_active": True},
             {
                 "$or": [
                     {"username": {"$regex": f"^{escaped_username}", "$options": "i"}},

@@ -4,6 +4,7 @@ import logging
 import re
 import time
 from uuid import uuid4
+from core.rate_limit import get_client_ip
 
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -29,6 +30,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                     "path": request.url.path,
                     "status_code": 500,
                     "duration_ms": duration_ms,
+                    "client_ip": get_client_ip(request),
                 },
             )
             raise
@@ -42,6 +44,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                 "path": request.url.path,
                 "status_code": response.status_code,
                 "duration_ms": duration_ms,
+                "client_ip": get_client_ip(request),
             },
         )
         return response

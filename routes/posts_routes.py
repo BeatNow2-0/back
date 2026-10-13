@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, Request
+from fastapi.responses import RedirectResponse
 
 from config.db import get_database, interactions_collection, lyrics_collection, post_collection, users_collection
 from config.security import get_current_user, get_user, get_user_id, get_username
+from config.settings import settings
+from core.rate_limit import enforce_rate_limit
 from core.mongo import parse_object_id
 from model.post_shemas import NewPost, PostInDB, PostShowed, PostUpdate
 from model.user_shemas import CurrentUser
@@ -16,6 +20,16 @@ from routes.interactions_routes import has_liked_post, has_saved_post
 from services.storage import delete_post_directory, prepare_beat_media, with_post_media_urls
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def _published_query() -> dict:
+    return {
+        "publication_status": "published",
+        "processing_status": "ready",
+        "preview_key": {"$exists": True, "$ne": None},
+        "visibility": {"$ne": "unpublished"},
+    }
 
 
 def _parse_optional_list(raw_value: Optional[str]) -> Optional[list[str]]:
@@ -45,6 +59,7 @@ def _with_media_urls(post: dict) -> dict:
 
 @router.post("/upload", response_model=PostInDB)
 async def upload_post(
+    request: Request,
     cover_file: UploadFile = File(...),
     audio_file: UploadFile = File(...),
     title: str = Form(...),
@@ -54,8 +69,19 @@ async def upload_post(
     moods: Optional[str] = Form(None),
     instruments: Optional[str] = Form(None),
     bpm: Optional[int] = Form(None),
+    musical_key: Optional[str] = Form(None),
+    visibility: str = Form("published"),
+    license_type: str = Form("unavailable"),
+    license_terms: Optional[str] = Form(None),
+    request_id: str = Form(..., min_length=16, max_length=80),
+    rights_confirmed: bool = Form(False),
+    preview_start: float | None = Form(None),
+    preview_end: float | None = Form(None),
     current_user: CurrentUser = Depends(get_current_user),
 ):
+    await enforce_rate_limit(request, f"beat-upload:{current_user.id}", settings.beat_upload_rate_limit)
+    if not rights_confirmed:
+        raise HTTPException(422, "Rights confirmation is required")
     new_post = NewPost(
         title=title,
         description=description,
@@ -64,9 +90,18 @@ async def upload_post(
         moods=_parse_optional_list(moods),
         instruments=_parse_optional_list(instruments),
         bpm=bpm,
+        musical_key=musical_key,
+        visibility=visibility,
+        license_type=license_type,
+        license_terms=license_terms,
     )
 
     user_id = await get_user_id(current_user.username)
+    existing = await post_collection.find_one({"user_id": user_id, "request_id": request_id})
+    if existing:
+        if existing.get("publication_status") == "processing":
+            raise HTTPException(status_code=409, detail="This upload is still processing")
+        return PostInDB(**_with_media_urls(existing))
     result = await post_collection.insert_one(
         {
             "user_id": user_id,
@@ -77,27 +112,49 @@ async def upload_post(
             **new_post.model_dump(),
             "audio_format": "pending",
             "cover_format": "pending",
+            "publication_status": "processing",
+            "processing_status": "processing",
+            "rights_confirmed": True,
+            "rights_confirmation_version": settings.rights_confirmation_version,
+            "rights_confirmed_at": datetime.now(timezone.utc),
+            "request_id": request_id,
         }
     )
     post_id = str(result.inserted_id)
 
     media_batch = None
     try:
-        media_batch = await prepare_beat_media(post_id, cover_file, audio_file)
+        media_batch = await prepare_beat_media(
+            post_id,
+            cover_file,
+            audio_file,
+            producer_id=user_id,
+            preview_start=preview_start,
+            preview_end=preview_end,
+        )
         media_batch.apply()
         update_result = await post_collection.update_one(
             {"_id": result.inserted_id},
-            {"$set": media_batch.database_fields},
+            {"$set": {**media_batch.database_fields, "publication_status": "published", "processing_status": "ready"}},
         )
         if update_result.matched_count == 0:
             raise RuntimeError("Post disappeared while attaching media")
     except Exception:
+        logger.warning("BEAT_PROCESSING_FAILED", extra={"user_id": user_id, "beat_id": post_id})
         if media_batch is not None:
             media_batch.rollback()
-        await post_collection.delete_one({"_id": result.inserted_id})
+        await post_collection.update_one(
+            {"_id": result.inserted_id},
+            {"$set": {
+                "publication_status": "failed",
+                "processing_status": "failed",
+                "processing_error": "preview_generation_failed",
+            }},
+        )
         delete_post_directory(user_id, post_id)
         raise
     media_batch.finalize()
+    logger.info("BEAT_UPLOAD", extra={"user_id": user_id, "beat_id": post_id})
 
     existing_post = await post_collection.find_one({"_id": result.inserted_id})
     return PostInDB(**_with_media_urls(existing_post))
@@ -106,6 +163,7 @@ async def upload_post(
 @router.put("/update/{post_id}", response_model=PostInDB)
 async def update_post(
     post_id: str,
+    request: Request,
     cover_file: UploadFile | None = File(None),
     audio_file: UploadFile | None = File(None),
     title: Optional[str] = Form(None),
@@ -115,6 +173,13 @@ async def update_post(
     moods: Optional[str] = Form(None),
     instruments: Optional[str] = Form(None),
     bpm: Optional[int] = Form(None),
+    musical_key: Optional[str] = Form(None),
+    visibility: Optional[str] = Form(None),
+    license_type: Optional[str] = Form(None),
+    license_terms: Optional[str] = Form(None),
+    rights_confirmed: bool = Form(False),
+    preview_start: float | None = Form(None),
+    preview_end: float | None = Form(None),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     post_object_id = parse_object_id(post_id, field="post identifier")
@@ -124,7 +189,12 @@ async def update_post(
 
     user_id = await get_user_id(current_user.username)
     if user_id != post["user_id"]:
+        logger.warning("PERMISSION_DENIED", extra={"user_id": user_id, "beat_id": post_id})
         raise HTTPException(status_code=403, detail="You are not authorized to update this publication")
+    if audio_file is not None:
+        await enforce_rate_limit(request, f"beat-upload:{current_user.id}", settings.beat_upload_rate_limit)
+        if not rights_confirmed:
+            raise HTTPException(422, "Rights confirmation is required when replacing audio")
 
     update_payload = PostUpdate(
         **{
@@ -135,17 +205,40 @@ async def update_post(
             "moods": _parse_optional_list(moods),
             "instruments": _parse_optional_list(instruments),
             "bpm": bpm,
+            "musical_key": musical_key,
+            "visibility": visibility,
+            "license_type": license_type,
+            "license_terms": license_terms,
         }
     )
     update_data = update_payload.model_dump(exclude_none=True)
-    media_batch = await prepare_beat_media(
-        post_id,
-        cover_file,
-        audio_file,
-        old_cover_key=post.get("cover_key"),
-        old_audio_key=post.get("audio_key"),
-    )
+    if audio_file is not None:
+        await post_collection.update_one(
+            {"_id": post_object_id},
+            {"$set": {"publication_status": "processing", "processing_status": "processing"}, "$unset": {"processing_error": ""}},
+        )
+    try:
+        media_batch = await prepare_beat_media(
+            post_id,
+            cover_file,
+            audio_file,
+            old_cover_key=post.get("cover_key"),
+            old_audio_key=post.get("preview_key") or post.get("audio_key"),
+            old_original_key=post.get("master_key") or post.get("original_storage_key"),
+            producer_id=user_id,
+            preview_start=preview_start,
+            preview_end=preview_end,
+        )
+    except Exception:
+        if audio_file is not None:
+            await post_collection.update_one(
+                {"_id": post_object_id},
+                {"$set": {"publication_status": "failed", "processing_status": "failed", "processing_error": "preview_generation_failed"}},
+            )
+        raise
     update_data.update(media_batch.database_fields)
+    if audio_file is not None:
+        update_data.update({"rights_confirmed": True, "rights_confirmation_version": settings.rights_confirmation_version, "rights_confirmed_at": datetime.now(timezone.utc), "publication_status": "published", "processing_status": "ready"})
 
     try:
         media_batch.apply()
@@ -155,8 +248,14 @@ async def update_post(
                 raise RuntimeError("Post disappeared while updating")
     except Exception:
         media_batch.rollback()
+        if audio_file is not None:
+            await post_collection.update_one(
+                {"_id": post_object_id},
+                {"$set": {"publication_status": "failed", "processing_status": "failed", "processing_error": "preview_storage_failed"}},
+            )
         raise
     media_batch.finalize()
+    logger.info("BEAT_UPDATE", extra={"user_id": user_id, "beat_id": post_id})
 
     updated_post = await post_collection.find_one({"_id": post_object_id})
     return PostInDB(**_with_media_urls(updated_post))
@@ -173,13 +272,15 @@ async def get_posts_for_user(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    posts = await post_collection.find({"user_id": user.id}).sort("publication_date", -1).skip(skip).limit(limit).to_list(length=limit)
+    current_user_id = await get_user_id(current_user.username)
+    visibility_filter = {} if current_user_id == str(user.id) else _published_query()
+    posts = await post_collection.find({"user_id": user.id, **visibility_filter}).sort([("publication_date", -1), ("_id", -1)]).skip(skip).limit(limit).to_list(length=limit)
     return [PostInDB(**_with_media_urls(post)) for post in posts]
 
 
 @router.get("/random", response_model=PostShowed)
 async def get_random_publication(current_user: CurrentUser = Depends(get_current_user), db=Depends(get_database)):
-    post_ids = await post_collection.aggregate([{"$sample": {"size": 1}}]).to_list(length=1)
+    post_ids = await post_collection.aggregate([{"$match": _published_query()}, {"$sample": {"size": 1}}]).to_list(length=1)
     if not post_ids:
         raise HTTPException(status_code=404, detail="No publications found")
     return await read_publication(str(post_ids[0]["_id"]), current_user, db)
@@ -200,14 +301,10 @@ async def get_feed_publications(
             if ObjectId.is_valid(raw_id):
                 excluded_object_ids.append(ObjectId(raw_id))
 
-    match_stage = {"_id": {"$nin": excluded_object_ids}} if excluded_object_ids else {}
-    sample_size = min(max(safe_limit * 3, safe_limit), 60)
-    pipeline = []
-    if match_stage:
-        pipeline.append({"$match": match_stage})
-    pipeline.append({"$sample": {"size": sample_size}})
-
-    sampled_posts = await post_collection.aggregate(pipeline).to_list(length=sample_size)
+    match_stage = _published_query()
+    if excluded_object_ids:
+        match_stage["_id"] = {"$nin": excluded_object_ids}
+    sampled_posts = await post_collection.find(match_stage).sort([("publication_date", -1), ("_id", -1)]).limit(safe_limit).to_list(length=safe_limit)
     if not sampled_posts:
         return []
     current_user_id = await get_user_id(current_user.username)
@@ -249,6 +346,11 @@ async def read_post(post_id: str, current_user: CurrentUser):
     post_dict = await post_collection.find_one({"_id": parse_object_id(post_id, field="post identifier")})
     if not post_dict:
         return None
+    current_user_id = await get_user_id(current_user.username)
+    if post_dict.get("processing_status") != "ready" and post_dict.get("user_id") != current_user_id:
+        return None
+    if post_dict.get("visibility") == "unpublished" and post_dict.get("user_id") != current_user_id:
+        return None
     creator_name = await get_username(post_dict["user_id"])
     return PostShowed(
         **_with_media_urls(post_dict),
@@ -266,8 +368,35 @@ async def delete_publication(post_id: str, current_user: CurrentUser = Depends(g
         raise HTTPException(status_code=404, detail="Publication not found")
     user_id = await get_user_id(current_user.username)
     if existing_publication["user_id"] != user_id:
+        logger.warning("PERMISSION_DENIED", extra={"user_id": user_id, "beat_id": post_id})
         raise HTTPException(status_code=403, detail="You are not authorized to delete this publication")
+    # Make the beat non-reproducible before touching files. If filesystem
+    # cleanup fails, the failed tombstone remains and DELETE can be retried.
+    await post_collection.update_one(
+        {"_id": post_object_id, "user_id": user_id},
+        {"$set": {"publication_status": "failed", "processing_status": "failed", "processing_error": "deletion_pending"}, "$unset": {"preview_key": ""}},
+    )
+    delete_post_directory(
+        user_id,
+        post_id,
+        existing_publication.get("master_key") or existing_publication.get("original_storage_key"),
+        existing_publication.get("preview_key"),
+    )
     await interactions_collection.delete_many({"post_id": post_id})
     await lyrics_collection.update_many({"post_id": post_id}, {"$set": {"post_id": None}})
     await post_collection.delete_one({"_id": post_object_id})
-    delete_post_directory(user_id, post_id)
+    logger.info("BEAT_DELETE", extra={"user_id": user_id, "beat_id": post_id})
+
+
+@router.get("/{post_id}/stream")
+async def stream_preview(post_id: str, request: Request):
+    client = request.client.host if request.client else "unknown"
+    await enforce_rate_limit(request, f"beat-stream:{client}", settings.beat_stream_rate_limit)
+    post = await post_collection.find_one({"_id": parse_object_id(post_id, field="post identifier"), **_published_query()})
+    if not post:
+        raise HTTPException(404, "Publication not found")
+    preview_url = _with_media_urls(post).get("audio_url")
+    if not preview_url:
+        raise HTTPException(404, "Preview not found")
+    logger.info("BEAT_STREAM", extra={"beat_id": post_id})
+    return RedirectResponse(preview_url, status_code=307)

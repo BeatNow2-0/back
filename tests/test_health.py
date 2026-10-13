@@ -33,8 +33,17 @@ def test_readyz_returns_200_payload_when_dependencies_are_ready(monkeypatch):
     }
 
 
-def test_legacy_media_endpoint_redirects_without_serving_file():
-    response = asyncio.run(main.serve_media("beats/abc/cover.webp"))
+def test_media_endpoint_only_redirects_allowlisted_public_prefix():
+    response = asyncio.run(main.serve_media("previews/abc/preview.mp3"))
     assert isinstance(response, RedirectResponse)
     assert response.status_code == 308
-    assert response.headers["location"] == "https://res.beatnow.app/beats/abc/cover.webp"
+    assert response.headers["location"] == "https://res.beatnow.app/previews/abc/preview.mp3"
+
+
+def test_media_endpoint_rejects_legacy_master_path():
+    import pytest
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(main.serve_media("beats/abc/audio.wav"))
+    assert error.value.status_code == 404

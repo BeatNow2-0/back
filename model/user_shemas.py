@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from bson import ObjectId
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
@@ -41,6 +41,7 @@ class User(BaseModel):
     bio: Optional[str] = Field(default=None, max_length=280)
     profile_image_url: Optional[str] = None
     photo_profile: Optional[str] = None
+    role: Literal["artist", "producer"] = "artist"
 
 
 class CurrentUser(User):
@@ -65,11 +66,28 @@ class UserPublic(User):
         return str(v) if isinstance(v, ObjectId) else v
 
 
-class UserInDB(UserPublic):
+class PublicProfile(BaseModel):
+    full_name: Optional[str] = None
+    username: str
+    is_active: bool
+    bio: Optional[str] = None
+    profile_image_url: Optional[str] = None
+    photo_profile: Optional[str] = None
+    role: Literal["artist", "producer"] = "artist"
+    id: Optional[str] = Field(default=None, alias="_id")
+    model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def convert_id(cls, v):
+        return str(v) if isinstance(v, ObjectId) else v
+
+
+class UserInDB(PublicProfile):
     pass
 
 
-class UserProfile(UserPublic):
+class UserProfile(PublicProfile):
     followers: int
     following: int
     post_num: int
@@ -94,6 +112,11 @@ class UserSearch(BaseModel):
 class LoginResponse(BaseModel):
     access_token: str
     refresh_token: str
+    token_type: str = "bearer"
+
+
+class WebLoginResponse(BaseModel):
+    access_token: str
     token_type: str = "bearer"
 
 

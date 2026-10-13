@@ -6,17 +6,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Request
+from bson import ObjectId
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from config.db import beat_analyses_collection, post_collection
 from config.security import get_current_user, get_user_id
 from config.settings import settings
+from core.rate_limit import enforce_rate_limit
 from model.post_shemas import NewPost, PostInDB
 from model.user_shemas import CurrentUser
 from services.beat_analysis.analyzer import analyze_beat
-from services.storage import MediaBatch, MediaReplacement, delete_post_directory, stage_file, storage, with_post_media_urls
+from services.beat_audio import probe_audio_file
+from services.storage import delete_post_directory, prepare_beat_media, with_post_media_urls
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -37,8 +40,12 @@ def _public(doc: dict) -> dict:
 
 
 @router.post("", status_code=201)
-async def create_analysis(file: UploadFile = File(...), current_user: CurrentUser = Depends(get_current_user)):
-    filename = Path(file.filename or "audio").name
+async def create_analysis(request: Request, file: UploadFile = File(...), current_user: CurrentUser = Depends(get_current_user)):
+    await enforce_rate_limit(request, f"beat-upload:{current_user.id}", settings.beat_upload_rate_limit)
+    raw_filename = file.filename or "audio"
+    if "/" in raw_filename or "\\" in raw_filename:
+        raise HTTPException(415, "Invalid audio filename")
+    filename = Path(raw_filename).name
     ext = Path(filename).suffix.lower().lstrip(".")
     if ext not in ALLOWED:
         raise HTTPException(415, "Unsupported audio format")
@@ -51,11 +58,12 @@ async def create_analysis(file: UploadFile = File(...), current_user: CurrentUse
     folder.mkdir(parents=True, exist_ok=False)
     original = folder / f"original.{ext}"
     total = 0
+    record_created = False
     try:
         with original.open("wb") as output:
             while chunk := await file.read(1024 * 1024):
                 total += len(chunk)
-                if total > settings.beat_analysis_max_upload_size:
+                if total > min(settings.beat_analysis_max_upload_size, settings.max_audio_upload_size):
                     raise HTTPException(413, "Audio file too large")
                 output.write(chunk)
         if not total:
@@ -63,6 +71,8 @@ async def create_analysis(file: UploadFile = File(...), current_user: CurrentUse
         user_id = await get_user_id(current_user.username)
         record = {"_id": analysis_id, "user_id": user_id, "original_filename": filename, "original_extension": ext, "temporary_original_path": str(original), "temporary_analysis_path": str(folder / "analysis.wav"), "status": "processing", "progress": 10, "analysis_version": "1.0", "created_at": datetime.now(timezone.utc), "expires_at": datetime.now(timezone.utc) + timedelta(hours=settings.beat_analysis_ttl_hours)}
         await beat_analyses_collection.insert_one(record)
+        record_created = True
+        await run_in_threadpool(probe_audio_file, original, ext)
         result = await run_in_threadpool(analyze_beat, original, folder / "analysis.wav")
         result["analysis_version"] = "1.0"
         await beat_analyses_collection.update_one({"_id": analysis_id}, {"$set": {"status": "completed", "progress": 100, "result_json": result, "completed_at": datetime.now(timezone.utc)}})
@@ -70,6 +80,11 @@ async def create_analysis(file: UploadFile = File(...), current_user: CurrentUse
         return {"analysis_id": str(analysis_id), "status": "completed", "expires_at": record["expires_at"], "analysis_version": "1.0", **result}
     except HTTPException:
         _remove({"_id": analysis_id})
+        if record_created:
+            await beat_analyses_collection.update_one(
+                {"_id": analysis_id},
+                {"$set": {"status": "failed", "progress": 0, "error": "Audio could not be analyzed"}},
+            )
         raise
     except RuntimeError as exc:
         if str(exc) in {"FFmpeg is required to analyze this audio", "FFprobe is required to validate audio duration"}:
@@ -122,45 +137,55 @@ async def discard_analysis(analysis_id: str, current_user: CurrentUser = Depends
 
 class PublishRequest(NewPost):
     analysis_id: str
+    rights_confirmed: bool = False
     preview_start: float | None = None
     preview_end: float | None = None
 
 
 async def publish_from_analysis(payload: PublishRequest, current_user: CurrentUser):
+    if not payload.rights_confirmed:
+        raise HTTPException(422, "Rights confirmation is required")
     doc = await _owned(payload.analysis_id, current_user)
     if doc["status"] != "completed" or doc["expires_at"] <= datetime.now(timezone.utc):
         raise HTTPException(409, "Analysis is not available for publishing")
     source = Path(doc["temporary_original_path"])
     if not source.is_file():
         raise HTTPException(410, "Temporary audio is no longer available")
-    audio_key = storage.generate_key("beats", "pending", f"audio.{doc['original_extension']}")
-    staged = stage_file(source, doc["original_extension"])
     claim = await beat_analyses_collection.update_one({"_id": doc["_id"], "status": "completed"}, {"$set": {"status": "publishing"}})
     if claim.matched_count == 0:
-        storage.delete(staged)
         raise HTTPException(409, "Analysis is already being published")
-    batch = MediaBatch([MediaReplacement(audio_key, staged, storage)], {"audio_key": audio_key, "audio_format": doc["original_extension"]})
+    user_id = doc["user_id"]
+    new_id = ObjectId()
+    post_id = str(new_id)
+    audio_upload = UploadFile(filename=doc["original_filename"], file=source.open("rb"))
+    batch = None
     result = None
     try:
         post = NewPost(**payload.model_dump(exclude={"analysis_id", "preview_start", "preview_end"}))
-        user_id = doc["user_id"]
-        result = await post_collection.insert_one({"user_id": user_id, "publication_date": datetime.now(timezone.utc), "likes": 0, "saves": 0, "views": 0, **post.model_dump(), "audio_format": "pending", "cover_format": "pending", "analysis_id": str(doc["_id"])})
-        post_id = str(result.inserted_id)
-        audio_key = storage.generate_key("beats", post_id, f"audio.{doc['original_extension']}")
-        batch.replacements[0].final_key = audio_key
+        batch = await prepare_beat_media(
+            post_id,
+            None,
+            audio_upload,
+            producer_id=user_id,
+            preview_start=payload.preview_start,
+            preview_end=payload.preview_end,
+        )
         batch.apply()
-        await post_collection.update_one({"_id": result.inserted_id}, {"$set": batch.database_fields})
-        batch.finalize()
+        result = await post_collection.insert_one({"_id": new_id, "user_id": user_id, "publication_date": datetime.now(timezone.utc), "likes": 0, "saves": 0, "views": 0, **post.model_dump(), "audio_format": settings.preview_format, "cover_format": "pending", "publication_status": "published", "processing_status": "ready", "rights_confirmed": True, "rights_confirmation_version": settings.rights_confirmation_version, "rights_confirmed_at": datetime.now(timezone.utc), "analysis_id": str(doc["_id"]), **batch.database_fields})
         await beat_analyses_collection.update_one({"_id": doc["_id"], "status": "publishing"}, {"$set": {"status": "published", "published_post_id": post_id}})
+        batch.finalize()
         _remove(doc)
     except Exception:
-        batch.rollback()
+        if batch:
+            batch.rollback()
         if result is not None:
-            await post_collection.delete_one({"_id": result.inserted_id})
-            delete_post_directory(user_id, post_id)
+            await post_collection.delete_one({"_id": new_id})
+            delete_post_directory(user_id, post_id, batch.database_fields.get("master_key") if batch else None, batch.database_fields.get("preview_key") if batch else None)
         await beat_analyses_collection.update_one({"_id": doc["_id"], "status": "publishing"}, {"$set": {"status": "completed"}})
         raise
-    saved = await post_collection.find_one({"_id": result.inserted_id})
+    finally:
+        await audio_upload.close()
+    saved = await post_collection.find_one({"_id": new_id})
     return PostInDB(**with_post_media_urls(saved))
 
 

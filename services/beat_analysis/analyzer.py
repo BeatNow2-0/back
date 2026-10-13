@@ -16,13 +16,13 @@ def convert_to_analysis_wav(source: Path, target: Path, timeout: int = 90) -> No
         raise RuntimeError("FFmpeg is required to analyze this audio")
     if not probe:
         raise RuntimeError("FFprobe is required to validate audio duration")
-    metadata = subprocess.run([probe, "-v", "error", "-show_entries", "format=duration", "-of", "json", str(source)], check=True, timeout=15, capture_output=True, text=True)
+    metadata = subprocess.run([probe, "-protocol_whitelist", "file,pipe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(source)], check=True, timeout=15, capture_output=True, text=True)
     duration = float(json.loads(metadata.stdout)["format"]["duration"])
     from config.settings import settings
     if duration <= 0 or duration > settings.beat_analysis_max_duration_seconds:
         raise ValueError("Audio duration exceeds the configured maximum")
     subprocess.run(
-        [executable, "-nostdin", "-v", "error", "-y", "-i", str(source), "-t", str(settings.beat_analysis_max_duration_seconds), "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", str(target)],
+        [executable, "-nostdin", "-v", "error", "-y", "-protocol_whitelist", "file,pipe", "-i", str(source), "-t", str(settings.beat_analysis_max_duration_seconds), "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", str(target)],
         check=True, timeout=timeout, capture_output=True,
     )
 

@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.db import post_collection, users_collection  # noqa: E402
+from config.settings import settings  # noqa: E402
 from services.storage import prepare_avatar, prepare_beat_media, storage  # noqa: E402
 
 
@@ -92,7 +93,10 @@ async def _migrate_post(post: dict, legacy_root: Path, execute: bool) -> None:
     post_id = str(post["_id"])
     user_id = str(post["user_id"])
     cover_complete = bool(post.get("cover_key") and storage.exists(post["cover_key"]))
-    audio_complete = bool(post.get("audio_key") and storage.exists(post["audio_key"]))
+    original_key = post.get("master_key") or post.get("original_storage_key")
+    private_original_complete = bool(original_key and (settings.beats_original_dir / original_key).is_file())
+    preview_key = post.get("preview_key")
+    audio_complete = bool(preview_key and storage.exists(preview_key) and private_original_complete)
     if cover_complete and audio_complete:
         _report("beat", post_id, "already_migrated")
         return
@@ -120,7 +124,9 @@ async def _migrate_post(post: dict, legacy_root: Path, execute: bool) -> None:
         cover_upload,
         audio_upload,
         old_cover_key=post.get("cover_key"),
-        old_audio_key=post.get("audio_key"),
+        old_audio_key=post.get("preview_key") or post.get("audio_key"),
+        old_original_key=post.get("master_key") or post.get("original_storage_key"),
+        producer_id=user_id,
     )
     try:
         batch.apply()
@@ -141,7 +147,7 @@ async def _migrate_post(post: dict, legacy_root: Path, execute: bool) -> None:
         if audio_upload:
             await audio_upload.close()
     batch.finalize()
-    _report("beat", post_id, "migrated", user_id=user_id, **batch.database_fields)
+    _report("beat", post_id, "migrated", user_id=user_id, audio_key=batch.database_fields.get("audio_key"), audio_format=batch.database_fields.get("audio_format"), original_bytes=batch.database_fields.get("original_size"))
 
 
 async def migrate(legacy_root: Path, execute: bool, user_id: str | None) -> None:

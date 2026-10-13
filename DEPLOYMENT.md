@@ -1,5 +1,7 @@
 # BeatNow Backend — Beta técnica
 
+Auditoría de seguridad para productores y checklist de corte de audio: [SECURITY_BETA.md](SECURITY_BETA.md). La revisión no modifica el VPS ni inspecciona los vhosts reales.
+
 ## Arquitectura
 
 FastAPI mantiene MongoDB como base de datos y escribe multimedia mediante `StorageProvider`. La implementación actual, `LocalStorageProvider`, usa claves relativas bajo `MEDIA_ROOT`; Nginx sirve esos archivos mediante `MEDIA_BASE_URL`.
@@ -10,7 +12,7 @@ FastAPI -> MongoDB Atlas
                                                    -> Nginx -> https://res.beatnow.app
 ```
 
-FastAPI no entrega imágenes ni audio. El endpoint legacy `/beatnow/{path}` solo devuelve una redirección permanente al host de recursos.
+Las portadas, avatares y previews son servidos por el host de recursos. Los masters no tienen endpoint HTTP y viven fuera de `MEDIA_ROOT`. `/beatnow/{path}` solo redirige los prefijos públicos permitidos (`avatars/`, `covers/`, `previews/`).
 
 ## Variables de entorno
 
@@ -31,6 +33,19 @@ MAX_AUDIO_UPLOAD_SIZE=52428800
 MAX_IMAGE_DIMENSION=4096
 MAX_IMAGE_PIXELS=40000000
 TRUSTED_PROXY_IPS=127.0.0.1,::1
+TRUSTED_HOSTS=api.beatnow.app,localhost,127.0.0.1
+BEATS_ORIGINAL_DIR=/srv/beatnow/private/beats/originals
+BEATS_PREVIEW_DIR=/srv/beatnow/media/previews
+FFMPEG_BINARY=ffmpeg
+FFPROBE_BINARY=ffprobe
+PREVIEW_DURATION_SECONDS=30
+PREVIEW_FORMAT=mp3
+PREVIEW_AUDIO_BITRATE=96k
+BEAT_PROCESSING_TIMEOUT_SECONDS=120
+BEAT_WATERMARK_ENABLED=true
+BEAT_WATERMARK_FILE=/srv/beatnow/private/audio-tags/beatnow-tag.wav
+BEAT_WATERMARK_INTERVAL_SECONDS=30
+RIGHTS_CONFIRMATION_VERSION=beta-1
 LOGIN_RATE_LIMIT=5
 REGISTER_RATE_LIMIT=3
 RESET_RATE_LIMIT=3
@@ -83,8 +98,8 @@ No eliminar el árbol legacy hasta comprobar MongoDB, URLs públicas, audio Rang
 
 ## Compatibilidad API
 
-- Los endpoints `/v1/api/posts/*` conservan el nombre `posts`, aunque la media nueva vive en `beats/<post_id>/`.
-- `cover_image_url`, `audio_url`, `isLiked`, `isSaved` y `_id` se mantienen.
+- Los endpoints `/v1/api/posts/*` conservan el nombre `posts`; la media pública nueva vive en `covers/<post_id>/` y `previews/<post_id>/`.
+- `cover_image_url`, `audio_url`, `isLiked`, `isSaved` y `_id` se mantienen. `audio_url` y `preview_url` son la misma URL de preview.
 - `caratula` continúa como alias de respuesta de `cover_image_url`; no existe un segundo archivo físico.
 - El avatar devuelve `profile_image_url` y el alias `photo_profile` en las operaciones de cambio/borrado.
 - Tokens JWT nuevos usan `sub=user_id`; el backend acepta temporalmente tokens access/refresh legacy con `sub=username`.
@@ -97,12 +112,14 @@ No eliminar el árbol legacy hasta comprobar MongoDB, URLs públicas, audio Rang
 Estas acciones no las realiza el código:
 
 1. Configurar las variables anteriores en el `EnvironmentFile` de `beatnow.service`.
-2. Verificar propietario y permisos: `beatnow:beatnow` debe escribir en `/srv/beatnow/media`; Nginx solo necesita lectura.
-3. Crear/verificar `avatars`, `posts`, `beats` y `temp` bajo `/srv/beatnow/media`.
-4. Instalar `requirements-production.txt` en un virtualenv limpio y ejecutar el smoke test.
-5. Ejecutar primero la migración en dry-run, revisar el resultado y hacer backup antes de `--execute`.
-6. Reiniciar `beatnow.service` y validar `/healthz`, `/readyz`, login, avatar, upload/update/delete de beat y reproducción Range.
-7. Rotar cualquier secreto que haya podido existir históricamente en Git; el código no puede confirmar ni ejecutar esa rotación externa.
+2. Configurar `BEATS_ORIGINAL_DIR` fuera de cualquier raíz pública (sugerido `/srv/beatnow/private/beats/originals`) y `BEATS_PREVIEW_DIR` dentro de `/srv/beatnow/media`.
+3. Verificar permisos: `beatnow` escribe en media y originals; Nginx solo necesita leer media y no debe leer masters.
+4. Crear/verificar `avatars`, `covers`, `previews` y `temp` bajo `/srv/beatnow/media`, además del directorio privado.
+5. Instalar `requirements-production.txt`, paquetes de sistema `ffmpeg`/`ffprobe` y ejecutar smoke test.
+6. Migrar medios legacy con `scripts/migrate_media_v2.py` cuando aplique; para masters públicos actuales usar `scripts/migrate_beat_masters.py`. Hacer backup y revisar dry-run antes de `--execute`.
+7. Bloquear todo prefijo legacy `beats/`, purgar caché/CDN antigua y comprobar que no existe ninguna ruta de descarga de masters.
+8. Reiniciar `beatnow.service` y validar `/healthz`, `/readyz`, login, avatar, upload/update/delete y reproducción Range.
+9. Rotar cualquier secreto que haya podido existir históricamente en Git; el código no puede confirmar ni ejecutar esa rotación externa.
 
 ## Acciones manuales — MongoDB
 
@@ -115,12 +132,14 @@ Activar y verificar backups de MongoDB Atlas. Probar una restauración antes de 
 Mantener `res.beatnow.app` apuntando a `/srv/beatnow/media`. Además:
 
 - `server_tokens off;`
-- `client_max_body_size` igual o ligeramente superior a `MAX_AUDIO_UPLOAD_SIZE`.
+- `client_max_body_size` ligeramente superior a `MAX_AUDIO_UPLOAD_SIZE` (la revisión sugiere `55m` para un máximo de 50 MiB).
 - Range habilitado para audio, tipos MIME correctos y cache largo para recursos versionables.
 - Bloquear `/metrics` públicamente o permitirlo solo desde localhost/red de monitoring.
 - Aplicar `limit_req` a login, registro, confirmación y reset; el limiter en proceso es una segunda barrera para un único worker, no un limiter distribuido.
 - Sobrescribir, no concatenar ciegamente, `X-Forwarded-For`; el backend solo confía en `TRUSTED_PROXY_IPS`.
 - Propagar `X-Request-ID` y configurar timeouts de proxy/upload apropiados.
+- Permitir únicamente los prefijos públicos necesarios (`/avatars/`, `/covers/`, `/previews/`) y devolver 404 para `/beats/`, `/private/`, extensiones/rutas de masters y dotfiles.
+- Mantener `BEATS_ORIGINAL_DIR` fuera de todo `root`/`alias` público y sin ninguna location Nginx, ni siquiera `internal`, durante esta fase.
 
 Ejecutar `nginx -t` antes de recargar. Nginx ya es responsable de servir media; Python no debe montar ese directorio públicamente.
 
@@ -137,7 +156,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/srv/beatnow/media /srv/beatnow/.beat-analysis-tmp
+ReadWritePaths=/srv/beatnow/media /srv/beatnow/.beat-analysis-tmp /srv/beatnow/private/beats/originals
 UMask=0027
 ```
 

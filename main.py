@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 from pymongo.errors import PyMongoError
@@ -26,6 +27,7 @@ from routes.routes import router as routes_router
 from routes.search_routes import router as search_router
 from routes.users_routes import router as users_router
 from routes.beat_analysis_routes import router as beat_analysis_router, publish_router as beat_publish_router
+from routes.copyright_routes import router as copyright_router
 from services.storage import StorageError, storage, storage_ready
 
 configure_logging()
@@ -55,13 +57,22 @@ async def lifespan(app: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title=settings.app_name, debug=settings.debug, lifespan=lifespan)
+app = FastAPI(
+    title=settings.app_name,
+    debug=settings.debug,
+    lifespan=lifespan,
+    docs_url=None if settings.environment == "production" else "/docs",
+    redoc_url=None if settings.environment == "production" else "/redoc",
+    openapi_url=None if settings.environment == "production" else "/openapi.json",
+)
 
 if settings.prometheus_enabled:
     Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 app.add_exception_handler(PyMongoError, handle_database_error)
 app.add_exception_handler(HTTPException, http_exception_handler)
 app.add_exception_handler(Exception, unhandled_exception_handler)
+if settings.environment == "production":
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.trusted_hosts)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestContextMiddleware)
 app.add_middleware(
@@ -85,6 +96,7 @@ app.include_router(mail_router, prefix="/v1/api/mail", tags=["mail"])
 app.include_router(download_router, prefix="/v1/api/download", tags=["download"])
 app.include_router(beat_analysis_router, prefix="/api/v1/beat-analysis", tags=["beat-analysis"])
 app.include_router(beat_publish_router, prefix="/api/v1/beats", tags=["beats"])
+app.include_router(copyright_router, prefix="/v1/api/copyright", tags=["copyright"])
 app.include_router(routes_router)
 
 
@@ -110,6 +122,9 @@ async def readyz():
 
 @app.get("/beatnow/{requested_path:path}", include_in_schema=False)
 async def serve_media(requested_path: str):
+    public_prefix = requested_path.replace("\\", "/").split("/", 1)[0]
+    if public_prefix not in {"avatars", "covers", "previews"}:
+        raise HTTPException(status_code=404, detail="File not found")
     try:
         target = storage.get_public_url(requested_path)
     except StorageError as exc:

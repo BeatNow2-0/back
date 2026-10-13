@@ -24,3 +24,4 @@ dumps/
 backups/
 *.dump
 *.archive
+.DS_Store

@@ -5,13 +5,24 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pymongo.errors import PyMongoError
 
-from config.db import get_database, lyrics_collection
+from config.db import get_database, lyrics_collection, post_collection
 from config.security import get_current_user, get_user_id
 from core.mongo import parse_object_id
 from model.lyrics_shemas import Lyrics, LyricsInDB, NewLyrics
 from model.user_shemas import CurrentUser
 
 router = APIRouter()
+
+
+async def _validate_linked_beat(post_id: str | None, user_id: str) -> None:
+    if not post_id:
+        return
+    beat = await post_collection.find_one(
+        {"_id": parse_object_id(post_id, field="post identifier"), "publication_status": "published", "processing_status": "ready", "preview_key": {"$exists": True, "$ne": None}},
+        {"user_id": 1, "visibility": 1},
+    )
+    if not beat or (beat.get("visibility") == "unpublished" and beat.get("user_id") != user_id):
+        raise HTTPException(status_code=404, detail="Beat not found")
 
 
 @router.get("/user", response_model=List[Lyrics])
@@ -33,6 +44,7 @@ async def create_lyrics(new_lyrics: NewLyrics, current_user: CurrentUser = Depen
     try:
         lyrics_dict = new_lyrics.model_dump()
         lyrics_dict["user_id"] = await get_user_id(current_user.username)
+        await _validate_linked_beat(new_lyrics.post_id, lyrics_dict["user_id"])
         result = await lyrics_collection.insert_one(lyrics_dict)
         return LyricsInDB(**lyrics_dict, id=str(result.inserted_id))
     except PyMongoError as e:
@@ -54,6 +66,7 @@ async def get_lyrics(lyrics_id: str, current_user: CurrentUser = Depends(get_cur
 async def update_lyrics(lyrics_id: str, updated_lyrics: NewLyrics, current_user: CurrentUser = Depends(get_current_user), db=Depends(get_database)):
     try:
         user_id = await get_user_id(current_user.username)
+        await _validate_linked_beat(updated_lyrics.post_id, user_id)
         lyrics_object_id = parse_object_id(lyrics_id, field="lyrics identifier")
         result = await lyrics_collection.update_one({"_id": lyrics_object_id, "user_id": user_id}, {"$set": updated_lyrics.model_dump()})
         if result.matched_count == 0:

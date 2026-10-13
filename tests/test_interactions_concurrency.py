@@ -51,6 +51,9 @@ class AtomicPosts:
             self.document[field] = self.document.get(field, 0) + amount
             return dict(self.document)
 
+    async def find_one(self, query):
+        return dict(self.document)
+
 
 def _user():
     return CurrentUser(
@@ -88,7 +91,7 @@ def test_concurrent_like_only_increments_once(monkeypatch):
         except HTTPException as exc:
             return exc.status_code
 
-    assert sorted(asyncio.run(_run_concurrently(attempt))) == [200, 400]
+    assert sorted(asyncio.run(_run_concurrently(attempt))) == [200, 200]
     assert posts.document["likes"] == 1
 
 
@@ -120,5 +123,5 @@ def test_concurrent_unsave_never_makes_counter_negative(monkeypatch):
         except HTTPException as exc:
             return exc.status_code
 
-    assert sorted(asyncio.run(_run_concurrently(attempt))) == [200, 400]
+    assert sorted(asyncio.run(_run_concurrently(attempt))) == [200, 200]
     assert posts.document["saves"] == 0

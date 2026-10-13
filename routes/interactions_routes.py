@@ -12,13 +12,19 @@ from config.db import get_database, interactions_collection, post_collection
 from config.security import check_post_exists, get_current_user, get_user_id
 from core.mongo import parse_object_id
 from model.user_shemas import CurrentUser
+from services.storage import with_post_media_urls
 
 router = APIRouter()
 VIEW_DEDUP_SECONDS = 30
 
 
 def _encoded(document: dict | None) -> dict | None:
-    return jsonable_encoder(document, custom_encoder={ObjectId: str}) if document else None
+    if not document:
+        return None
+    safe = with_post_media_urls(document) if "title" in document else dict(document)
+    for field in ("master_key", "original_storage_key", "original_path", "temporary_original_path", "temporary_analysis_path", "original_sha256", "processing_error"):
+        safe.pop(field, None)
+    return jsonable_encoder(safe, custom_encoder={ObjectId: str})
 
 
 async def _increment_post_counter(post_id: str, field: str, amount: int) -> dict | None:
@@ -48,9 +54,14 @@ async def _add_transition(post_id: str, field: str, current_user: CurrentUser) -
             return_document=ReturnDocument.AFTER,
         )
     except DuplicateKeyError as exc:
-        raise HTTPException(status_code=400, detail=f"{field} already exists") from exc
+        interaction = None
     if not interaction:
-        raise HTTPException(status_code=400, detail=f"{field} already exists")
+        current_post = await post_collection.find_one({"_id": parse_object_id(post_id, field="post identifier")})
+        return {
+            "message": "No change; interaction already exists",
+            "post": _encoded(current_post),
+            "counted": False,
+        }
     counter = "likes" if field == "like_date" else "saves"
     updated_post = await _increment_post_counter(post_id, counter, 1)
     if not updated_post:
@@ -76,8 +87,12 @@ async def _remove_transition(post_id: str, field: str, current_user: CurrentUser
         return_document=ReturnDocument.BEFORE,
     )
     if not previous:
-        label = "Like" if field == "like_date" else "Save"
-        raise HTTPException(status_code=400, detail=f"{label} does not exist")
+        current_post = await post_collection.find_one({"_id": parse_object_id(post_id, field="post identifier")})
+        return {
+            "message": "No change; interaction was already absent",
+            "post": _encoded(current_post),
+            "counted": False,
+        }
     counter = "likes" if field == "like_date" else "saves"
     updated_post = await _increment_post_counter(post_id, counter, -1)
     return {

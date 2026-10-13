@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException, UploadFile
+from starlette.requests import Request
 
 from model.user_shemas import CurrentUser
 from routes import beat_analysis_routes as routes
@@ -15,6 +16,10 @@ from routes import beat_analysis_routes as routes
 
 UID = "507f1f77bcf86cd799439011"
 USER = CurrentUser(_id=UID, username="owner", email="x@example.com", password="x", is_active=True)
+
+
+def request():
+    return Request({"type": "http", "method": "POST", "path": "/", "headers": [], "client": ("127.0.0.1", 1235), "server": ("test", 80), "scheme": "http", "query_string": b""})
 
 
 def wav_bytes():
@@ -62,8 +67,9 @@ def test_upload_valid_audio_and_persist_analysis(monkeypatch, tmp_path):
     async def user_id(_): return UID
     monkeypatch.setattr(routes, "get_user_id", user_id)
     monkeypatch.setattr(routes, "analyze_beat", lambda src, dst: {"audio": {"duration_seconds": .1}, "musical": {}, "loudness": {}, "stereo": {}, "frequency_balance": {}, "preview": {}, "insights": []})
+    monkeypatch.setattr(routes, "probe_audio_file", lambda *_: .1)
     upload = UploadFile(filename="beat.wav", file=io.BytesIO(wav_bytes()), headers={"content-type": "audio/wav"})
-    result = asyncio.run(routes.create_analysis(upload, USER))
+    result = asyncio.run(routes.create_analysis(request(), upload, USER))
     assert result["status"] == "completed"
     assert collection.docs[result["analysis_id"]]["result_json"]["audio"]["duration_seconds"] == .1
 
@@ -75,9 +81,10 @@ def test_upload_rejects_invalid_files(monkeypatch, tmp_path, name, content, expe
     async def user_id(_): return UID
     monkeypatch.setattr(routes, "get_user_id", user_id)
     monkeypatch.setattr(routes, "analyze_beat", lambda *_: (_ for _ in ()).throw(ValueError("bad audio")))
+    monkeypatch.setattr(routes, "probe_audio_file", lambda *_: .1)
     upload = UploadFile(filename=name, file=io.BytesIO(content), headers={"content-type": "audio/wav" if name.endswith("wav") else "application/octet-stream"})
     with pytest.raises(HTTPException) as exc:
-        asyncio.run(routes.create_analysis(upload, USER))
+        asyncio.run(routes.create_analysis(request(), upload, USER))
     assert exc.value.status_code == expected
 
 
@@ -85,8 +92,29 @@ def test_upload_enforces_streamed_size_limit(monkeypatch, tmp_path):
     monkeypatch.setattr(routes.settings, "media_root", tmp_path)
     monkeypatch.setattr(routes.settings, "beat_analysis_max_upload_size", 8)
     upload = UploadFile(filename="x.wav", file=io.BytesIO(b"0123456789"), headers={"content-type": "audio/wav"})
-    with pytest.raises(HTTPException) as exc: asyncio.run(routes.create_analysis(upload, USER))
+    with pytest.raises(HTTPException) as exc: asyncio.run(routes.create_analysis(request(), upload, USER))
     assert exc.value.status_code == 413
+
+
+def test_upload_marks_created_analysis_failed_on_validation_error(monkeypatch, tmp_path):
+    collection = Collection()
+    monkeypatch.setattr(routes, "beat_analyses_collection", collection)
+    monkeypatch.setattr(routes.settings, "media_root", tmp_path)
+    async def user_id(_): return UID
+    monkeypatch.setattr(routes, "get_user_id", user_id)
+    monkeypatch.setattr(
+        routes,
+        "probe_audio_file",
+        lambda *_: (_ for _ in ()).throw(HTTPException(415, "Invalid audio")),
+    )
+    upload = UploadFile(filename="beat.wav", file=io.BytesIO(wav_bytes()), headers={"content-type": "audio/wav"})
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(routes.create_analysis(request(), upload, USER))
+
+    assert exc.value.status_code == 415
+    assert len(collection.docs) == 1
+    assert next(iter(collection.docs.values()))["status"] == "failed"
 
 
 def test_get_owner_guard_discard_and_missing(monkeypatch, tmp_path):
@@ -128,7 +156,7 @@ def test_publish_uses_existing_temp_audio(monkeypatch, tmp_path):
     analysis_id = str(uuid4())
     source = tmp_path / "original.wav"
     source.write_bytes(b"audio")
-    doc = {"_id": analysis_id, "user_id": UID, "status": "completed", "expires_at": datetime.now(timezone.utc) + timedelta(hours=1), "temporary_original_path": str(source), "original_extension": "wav"}
+    doc = {"_id": analysis_id, "user_id": UID, "status": "completed", "expires_at": datetime.now(timezone.utc) + timedelta(hours=1), "temporary_original_path": str(source), "original_filename": "original.wav", "original_extension": "wav"}
     analyses = Collection({analysis_id: doc})
     posts = Collection()
     monkeypatch.setattr(routes, "beat_analyses_collection", analyses)
@@ -141,21 +169,13 @@ def test_publish_uses_existing_temp_audio(monkeypatch, tmp_path):
         def apply(self): pass
         def finalize(self): pass
         def rollback(self): pass
-    monkeypatch.setattr(routes, "stage_file", lambda *args: "temp/staged.wav")
-    monkeypatch.setattr(routes, "MediaBatch", lambda *args: Batch())
-    monkeypatch.setattr(routes, "MediaReplacement", lambda *args: object())
+    async def prepare(*args, **kwargs): return Batch()
+    monkeypatch.setattr(routes, "prepare_beat_media", prepare)
     monkeypatch.setattr(routes, "delete_post_directory", lambda *args: None)
     monkeypatch.setattr(routes, "with_post_media_urls", lambda post: post)
-    result_id = "507f1f77bcf86cd799439099"
-    async def insert(doc):
-        posts.docs[result_id] = {**doc, "_id": result_id}
-        return SimpleNamespace(inserted_id=result_id)
-    posts.insert_one = insert
-    async def find_post(q): return posts.docs[result_id]
+    async def find_post(q): return posts.docs.get(q["_id"])
     posts.find_one = find_post
-    async def update_post(q, update): posts.docs[result_id].update(update["$set"]); return SimpleNamespace(matched_count=1)
-    posts.update_one = update_post
-    payload = routes.PublishRequest(analysis_id=analysis_id, title="Test")
+    payload = routes.PublishRequest(analysis_id=analysis_id, title="Test", rights_confirmed=True)
     published = asyncio.run(routes.publish_from_analysis(payload, USER))
     assert published.title == "Test"
     assert doc["status"] == "published"

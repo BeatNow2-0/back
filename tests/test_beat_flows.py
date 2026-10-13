@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 from bson import ObjectId
 from fastapi import HTTPException
+from starlette.requests import Request
 
 from model.user_shemas import CurrentUser
 from routes import posts_routes
@@ -31,8 +32,12 @@ def _post():
         "views": 0,
         "cover_format": "webp",
         "audio_format": "mp3",
-        "cover_key": f"beats/{POST_ID}/cover.webp",
-        "audio_key": f"beats/{POST_ID}/audio.mp3",
+        "cover_key": f"covers/{POST_ID}/cover.webp",
+        "audio_key": f"previews/{POST_ID}/preview.mp3",
+        "preview_key": f"previews/{POST_ID}/preview.mp3",
+        "master_key": f"{OWNER_ID}/master.wav",
+        "processing_status": "ready",
+        "publication_status": "published",
     }
 
 
@@ -46,18 +51,26 @@ def _user(user_id=OWNER_ID):
     )
 
 
+def _request():
+    return Request({"type": "http", "method": "POST", "path": "/", "headers": [], "client": ("127.0.0.1", 1234), "server": ("test", 80), "scheme": "http", "query_string": b""})
+
+
 class FakePosts:
     def __init__(self, document, fail_update=False):
         self.document = document
         self.fail_update = fail_update
+        self.update_calls = 0
 
     async def find_one(self, query):
         return dict(self.document) if self.document else None
 
     async def update_one(self, query, update):
-        if self.fail_update:
+        self.update_calls += 1
+        if self.fail_update and self.update_calls == 2:
             raise RuntimeError("simulated Mongo failure")
         self.document.update(update.get("$set", {}))
+        for field in update.get("$unset", {}):
+            self.document.pop(field, None)
         return SimpleNamespace(matched_count=1)
 
     async def delete_one(self, query):
@@ -68,10 +81,13 @@ class FakePosts:
 class FakeBatch:
     def __init__(self):
         self.database_fields = {
-            "cover_key": f"beats/{POST_ID}/cover.webp",
+            "cover_key": f"covers/{POST_ID}/cover.webp",
             "cover_format": "webp",
-            "audio_key": f"beats/{POST_ID}/audio.wav",
-            "audio_format": "wav",
+            "audio_key": f"previews/{POST_ID}/preview.mp3",
+            "preview_key": f"previews/{POST_ID}/preview.mp3",
+            "master_key": f"{OWNER_ID}/master.wav",
+            "audio_format": "mp3",
+            "processing_status": "ready",
         }
         self.applied = False
         self.rolled_back = False
@@ -110,6 +126,7 @@ class CreatePosts:
 def _update_call(current_user):
     return posts_routes.update_post(
         POST_ID,
+        request=_request(),
         cover_file=object(),
         audio_file=object(),
         title="Updated",
@@ -119,12 +136,20 @@ def _update_call(current_user):
         moods=None,
         instruments=None,
         bpm=120,
+        musical_key=None,
+        visibility=None,
+        license_type=None,
+        license_terms=None,
+        rights_confirmed=True,
+        preview_start=None,
+        preview_end=None,
         current_user=current_user,
     )
 
 
 def _upload_call(current_user):
     return posts_routes.upload_post(
+        request=_request(),
         cover_file=object(),
         audio_file=object(),
         title="New beat",
@@ -134,6 +159,14 @@ def _upload_call(current_user):
         moods="focused",
         instruments="drums",
         bpm=100,
+        musical_key=None,
+        visibility="published",
+        license_type="unavailable",
+        license_terms=None,
+        request_id="test-request-id-0001",
+        rights_confirmed=True,
+        preview_start=None,
+        preview_end=None,
         current_user=current_user,
     )
 
@@ -154,8 +187,9 @@ def test_beat_create_attaches_storage_keys(monkeypatch):
 
     created = asyncio.run(_upload_call(_user()))
     assert batch.applied and batch.finalized
-    assert created.cover_key == f"beats/{POST_ID}/cover.webp"
-    assert created.audio_key == f"beats/{POST_ID}/audio.wav"
+    assert created.cover_key == f"covers/{POST_ID}/cover.webp"
+    assert created.audio_url == f"https://res.beatnow.app/previews/{POST_ID}/preview.mp3"
+    assert created.preview_url == created.audio_url
 
 
 def test_beat_create_rolls_back_document_when_media_fails(monkeypatch):
@@ -181,7 +215,8 @@ def test_beat_create_rolls_back_document_when_media_fails(monkeypatch):
     with pytest.raises(RuntimeError):
         asyncio.run(_upload_call(_user()))
     assert batch.rolled_back
-    assert collection.document is None
+    assert collection.document["processing_status"] == "failed"
+    assert collection.document["publication_status"] == "failed"
     assert deleted_directories == [(OWNER_ID, POST_ID)]
 
 
@@ -202,8 +237,9 @@ def test_beat_update_commits_media_and_generates_new_urls(monkeypatch):
     updated = asyncio.run(_update_call(_user()))
     assert batch.applied and batch.finalized and not batch.rolled_back
     assert updated.title == "Updated"
-    assert updated.cover_image_url == f"https://res.beatnow.app/beats/{POST_ID}/cover.webp"
-    assert updated.audio_url == f"https://res.beatnow.app/beats/{POST_ID}/audio.wav"
+    assert updated.cover_image_url == f"https://res.beatnow.app/covers/{POST_ID}/cover.webp"
+    assert updated.audio_url == f"https://res.beatnow.app/previews/{POST_ID}/preview.mp3"
+    assert updated.preview_url == updated.audio_url
 
 
 def test_beat_update_rolls_back_media_when_mongo_fails(monkeypatch):
@@ -266,7 +302,7 @@ def test_beat_delete_removes_relations_and_media(monkeypatch):
 
     asyncio.run(posts_routes.delete_publication(POST_ID, _user(), None))
     assert collection.document is None
-    assert [call[0] for call in calls] == ["interactions", "lyrics", "storage"]
+    assert [call[0] for call in calls] == ["storage", "interactions", "lyrics"]
 
 
 def test_post_id_invalid_is_422_and_valid_missing_is_404(monkeypatch):

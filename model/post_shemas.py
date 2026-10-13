@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from bson import ObjectId
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -15,6 +15,10 @@ class NewPost(BaseModel):
     moods: Optional[List[str]] = Field(default=None, max_length=20)
     instruments: Optional[List[str]] = Field(default=None, max_length=20)
     bpm: Optional[int] = Field(default=None, ge=1, le=400)
+    musical_key: Optional[str] = Field(default=None, max_length=12)
+    visibility: Literal["published", "unpublished"] = "published"
+    license_type: Literal["unavailable", "free_noncommercial", "contact"] = "unavailable"
+    license_terms: Optional[str] = Field(default=None, max_length=2000)
     model_config = ConfigDict(str_strip_whitespace=True)
 
 
@@ -26,6 +30,10 @@ class PostUpdate(BaseModel):
     moods: Optional[List[str]] = Field(default=None, max_length=20)
     instruments: Optional[List[str]] = Field(default=None, max_length=20)
     bpm: Optional[int] = Field(default=None, ge=1, le=400)
+    musical_key: Optional[str] = Field(default=None, max_length=12)
+    visibility: Optional[Literal["published", "unpublished"]] = None
+    license_type: Optional[Literal["unavailable", "free_noncommercial", "contact"]] = None
+    license_terms: Optional[str] = Field(default=None, max_length=2000)
     model_config = ConfigDict(str_strip_whitespace=True)
 
 
@@ -38,10 +46,12 @@ class Post(NewPost):
     saves: int = 0
     views: int = 0
     audio_url: Optional[str] = None
+    preview_url: Optional[str] = None
     cover_image_url: Optional[str] = None
     caratula: Optional[str] = None
     audio_key: Optional[str] = None
     cover_key: Optional[str] = None
+    media_status: Literal["processing", "ready", "failed"] = "ready"
 
 
 class PostInDB(Post):

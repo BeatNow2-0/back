@@ -2,7 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from services.storage import LocalStorageProvider, MediaBatch, MediaReplacement, StorageError, prepare_avatar, with_post_media_urls
+from services.beat_audio import ProcessedBeatAudio
+from services.storage import LocalStorageProvider, MediaBatch, MediaReplacement, StorageError, delete_post_directory, prepare_avatar, with_post_media_urls
 
 
 def _provider(tmp_path: Path) -> LocalStorageProvider:
@@ -91,13 +92,15 @@ def test_new_media_urls_use_resource_domain():
         {
             "_id": "beat123",
             "user_id": "user123",
-            "cover_key": "beats/beat123/cover.webp",
-            "audio_key": "beats/beat123/audio.mp3",
+            "cover_key": "covers/beat123/cover.webp",
+            "preview_key": "previews/beat123/preview.mp3",
+            "processing_status": "ready",
         }
     )
-    assert payload["cover_image_url"] == "https://res.beatnow.app/beats/beat123/cover.webp"
+    assert payload["cover_image_url"] == "https://res.beatnow.app/covers/beat123/cover.webp"
     assert payload["caratula"] == payload["cover_image_url"]
-    assert payload["audio_url"] == "https://res.beatnow.app/beats/beat123/audio.mp3"
+    assert payload["audio_url"] == "https://res.beatnow.app/previews/beat123/preview.mp3"
+    assert payload["preview_url"] == payload["audio_url"]
 
 
 def test_prepare_avatar_generates_a_unique_versioned_key(tmp_path, monkeypatch):
@@ -143,3 +146,75 @@ def test_avatar_batch_removes_old_key_after_finalize_and_rolls_back_on_failure(t
     assert not provider.exists(old_key)
     assert provider.read(new_key) == b"new-avatar"
     assert not provider.exists("temp/new-avatar.webp")
+
+
+def test_audio_replacement_removes_old_preview_and_master(tmp_path, monkeypatch):
+    import services.storage as storage_module
+
+    provider = _provider(tmp_path)
+    private_root = tmp_path / "private"
+    old_master_key = "owner/old.wav"
+    old_master = private_root / old_master_key
+    old_master.parent.mkdir(parents=True)
+    old_master.write_bytes(b"old-master")
+    old_preview_key = "previews/beat123/old.mp3"
+    provider.save(old_preview_key, b"old-preview")
+    provider.save("temp/new-preview.mp3", b"new-preview")
+
+    staging = private_root / ".processing-test"
+    staging.mkdir(parents=True)
+    staged_master = staging / "new.wav"
+    staged_master.write_bytes(b"new-master")
+    staged_preview = staging / "new.mp3"
+    staged_preview.write_bytes(b"new-preview")
+    audio = ProcessedBeatAudio(
+        staged_original=staged_master,
+        staged_preview=staged_preview,
+        master_key="owner/new.wav",
+        original_filename="new.wav",
+        original_sha256="hash",
+        original_size=10,
+        preview_size=11,
+        duration=30,
+        audio_format="wav",
+        mime_type="audio/wav",
+        preview_format="mp3",
+        preview_mime_type="audio/mpeg",
+    )
+    new_preview_key = "previews/beat123/preview.mp3"
+    batch = MediaBatch(
+        [MediaReplacement(new_preview_key, "temp/new-preview.mp3", provider)],
+        {"master_key": audio.master_key, "preview_key": new_preview_key},
+        {old_preview_key},
+        private_audio=audio,
+        old_original_key=old_master_key,
+    )
+    monkeypatch.setattr(storage_module.settings, "beats_original_dir", private_root)
+
+    batch.apply()
+    batch.finalize()
+
+    assert provider.read(new_preview_key) == b"new-preview"
+    assert (private_root / "owner/new.wav").read_bytes() == b"new-master"
+    assert not provider.exists(old_preview_key)
+    assert not old_master.exists()
+
+
+def test_delete_removes_public_preview_and_private_master(tmp_path, monkeypatch):
+    import services.storage as storage_module
+
+    provider = _provider(tmp_path)
+    private_root = tmp_path / "private"
+    master_key = "owner/master.wav"
+    master = private_root / master_key
+    master.parent.mkdir(parents=True)
+    master.write_bytes(b"master")
+    preview_key = "previews/beat123/preview.mp3"
+    provider.save(preview_key, b"preview")
+    monkeypatch.setattr(storage_module, "storage", provider)
+    monkeypatch.setattr(storage_module.settings, "beats_original_dir", private_root)
+
+    delete_post_directory("owner", "beat123", master_key, preview_key)
+
+    assert not provider.exists(preview_key)
+    assert not master.exists()

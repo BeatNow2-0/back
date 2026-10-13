@@ -52,6 +52,7 @@ async def authenticate_user_credentials(username: str, password: str) -> Current
         {"username": {"$regex": f"^{re.escape(normalized_username)}$", "$options": "i"}}
     )
     if not user_dict or not verify_password(password, user_dict.get("password", "")):
+        logger.warning("AUTH_FAILED")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
@@ -323,7 +324,16 @@ async def get_post_owner_id(post_id: str) -> str:
 
 
 async def check_post_exists(post_id: str, db=None):
-    post = await post_collection.find_one({"_id": parse_object_id(post_id, field="post identifier")}, {"_id": 1})
+    post = await post_collection.find_one(
+        {
+            "_id": parse_object_id(post_id, field="post identifier"),
+            "publication_status": "published",
+            "processing_status": "ready",
+            "preview_key": {"$exists": True, "$ne": None},
+            "visibility": {"$ne": "unpublished"},
+        },
+        {"_id": 1},
+    )
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
